@@ -54,19 +54,31 @@ python fisher_scanner.py --once --pool-file pool.csv
 注意：新浪日线没有成交额字段，脚本用「成交量 × 典型价」近似，临界票可能有少量出入。
 `pool.csv` 中的 `avg_amount`（亿元）/`avg_amplitude`（%）两列供人工核对，扫描器只读 code/name。
 
-### 方案一：右侧 / 左侧 / 深水 三池（build_pool_gm.py，掘金版）
+### 方案一：右侧 / 左侧 / 深水 三池构建（两个数据源任选）
 
-三池构建现用掘金 gm 数据源（需掘金终端运行并登录，token 在 `gm_token.key`）：
+三池输出文件名相同（`pool_right.csv` / `pool_left.csv` / `pool_deep.csv`），扫描器无需任何改动。
+
+**方案 A：掘金 gm（推荐，需安装掘金终端并登录）**
 
 ```bash
-.venv-gm\Scripts\python.exe build_pool_gm.py            # 全量（约几分钟，走本地终端，极快）
-.venv-gm\Scripts\python.exe build_pool_gm.py --resume   # 断点续跑
-# 备用：新浪版（终端不可用时）
-.venv\Scripts\python.exe build_pool_dual.py
+python -m venv .venv-gm                                    # 首次：独立环境（gm 依赖老版 pandas）
+.venv-gm\Scripts\python.exe -m pip install gm
+# 在掘金终端生成 token，写入 gm_token.key（一行，已 gitignore）
+.venv-gm\Scripts\python.exe build_pool_gm.py               # 全量约 2 分钟，走本地终端，无新浪限流
+.venv-gm\Scripts\python.exe build_pool_gm.py --resume      # 断点续跑
 ```
 
-gm 版改进：自带剔 ST/停牌、按上市日期精确过滤满 1 年、真实成交额、前复权日线；
-无新浪限流风险。分类逻辑与新浪版完全一致。
+优点：自带剔 ST/停牌、按上市日期精确过滤满 1 年、真实成交额、前复权日线、极快。
+
+**方案 B：新浪（无需注册任何账号，开箱即用）**
+
+```bash
+pip install -r requirements.txt
+python build_pool_dual.py            # 全量约 90 分钟，建议夜间运行
+python build_pool_dual.py --resume   # 断点续跑
+```
+
+两个方案的过滤/分类逻辑完全一致，输出可互相替换：
 
 ```bash
 # 盘中按策略选用（scan_all.cmd 已含全部三个池 + 持仓监控）：
