@@ -268,6 +268,8 @@ def pool_label(args):
         return "深水鱼塘"
     if "t0" in f:
         return "T0鱼塘"
+    if "t1" in f:
+        return "T1鱼塘"
     return "鱼塘"
 
 
@@ -284,6 +286,8 @@ def pool_tag(args):
         return "deep"
     if "t0" in f:
         return "t0"
+    if "t1" in f:
+        return "t1"
     return ""
 
 

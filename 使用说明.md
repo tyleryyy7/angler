@@ -54,10 +54,10 @@ python fisher_scanner.py --once --pool-file pool.csv
 注意：新浪日线没有成交额字段，脚本用「成交量 × 典型价」近似，临界票可能有少量出入。
 `pool.csv` 中的 `avg_amount`（亿元）/`avg_amplitude`（%）两列供人工核对，扫描器只读 code/name。
 
-### 方案一：右侧 / 左侧 / 深水 / T0 ETF 四池构建（两个数据源任选）
+### 方案一：右侧 / 左侧 / 深水 / T0 / T1 五池构建（两个数据源任选）
 
-四个池一次构建（T0 ETF 池仅 gm 版支持），输出文件名固定
-（`pool_right.csv` / `pool_left.csv` / `pool_deep.csv` / `pool_t0.csv`），扫描器无需任何改动。
+五个池一次构建（T0/T1 ETF 池仅 gm 版支持），输出文件名固定
+（`pool_right.csv` / `pool_left.csv` / `pool_deep.csv` / `pool_t0.csv` / `pool_t1.csv`），扫描器无需任何改动。
 
 **方案 A：掘金 gm（推荐，需安装掘金终端并登录）**
 
@@ -82,11 +82,12 @@ python build_pool_dual.py --resume   # 断点续跑
 两个方案的过滤/分类逻辑完全一致，输出可互相替换：
 
 ```bash
-# 盘中按策略选用（scan_all.cmd 已含全部四个池 + 持仓监控）：
+# 盘中按策略选用（scan_all.cmd 已含全部五个池 + 持仓监控）：
 python fisher_scanner.py --once --pool-file pool_right.csv   # 右侧
 python fisher_scanner.py --once --pool-file pool_left.csv    # 左侧
 python fisher_scanner.py --once --pool-file pool_deep.csv    # 深水
 python fisher_scanner.py --once --pool-file pool_t0.csv      # T+0 ETF
+python fisher_scanner.py --once --pool-file pool_t1.csv      # T+1 ETF
 ```
 
 公共条件：仅沪深主板（剔创业板/科创板/北交所）、非 ST/退、非停牌、股价 ≥ 2 元、
@@ -99,7 +100,8 @@ python fisher_scanner.py --once --pool-file pool_t0.csv      # T+0 ETF
 | 右侧 pool_right.csv | MACD DIF 连升两日 且 DIF > DEA 且 **DIF > 0** | 零上趋势已成，追随 |
 | 左侧 pool_left.csv | MACD DIF 连升两日 且 DIF < DEA 且 **DIF < 0** | 零下拐点将至，埋伏 |
 | 深水 pool_deep.csv（实验） | 无 MACD 闸门，日线 Fisher < -2 | 深度超卖反弹 |
-| T0 pool_t0.csv | T+0 ETF（trade_n=0，剔联接/货币，上市 120 天+，20 日均成交额 ≥ 1 亿、振幅 ≥ 1%） | 当日可进出 |
+| T0 pool_t0.csv | T+0 ETF + 日线 Fisher < -2（剔联接/货币，上市 120 天+，成交额 ≥ 1 亿、振幅 ≥ 1%） | 超卖反弹，当日可进出 |
+| T1 pool_t1.csv | T+1 ETF + 日线 Fisher < -2（同上过滤） | 超卖反弹 |
 
 （零上回调 DIF>0 但 DIF<DEA、零下反弹 DIF<0 但 DIF>DEA 的中间态两边都不入。）
 
