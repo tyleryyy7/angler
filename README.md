@@ -29,7 +29,9 @@ fisher_60min_scanner/
 ├── build_pool.py        # 预筛股票池生成器（旧方案，已弃用留档）
 ├── build_pool_dual.py   # 三池生成器（新浪版，备用）
 ├── build_pool_gm.py     # 三池生成器（掘金 gm 版，当前默认；跑在 .venv-gm）
-├── scan_all.cmd         # 定时任务入口：右侧池 + 左侧池 + 持仓下穿 依次扫描
+├── scan_all.cmd         # 定时任务入口：五个池 + 持仓下穿 依次扫描
+├── build_pool.cmd       # 建池任务入口（gm 版）
+├── run_hidden.vbs       # 隐藏控制台启动器（计划任务经它调用 .cmd，不弹窗）
 ├── holdings.csv         # 持仓清单（--buy 登记，下穿监控对象）
 ├── requirements.txt     # 依赖
 ├── 使用说明.md          # 本文件
@@ -152,18 +154,20 @@ Windows 已在「任务计划程序」注册 5 个任务（用 `schtasks /query 
 
 | 任务名 | 触发 | 动作 |
 |---|---|---|
-| `fisher_建池` | 工作日 00:00 | `build_pool_gm.py` 重建三池（pool_right/left/deep.csv，掘金数据源，需终端运行） |
-| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | 运行 `scan_all.cmd`：依次扫右侧池、左侧池、深水池、持仓（下穿），推送企业微信 |
+| `fisher_建池` | 工作日 00:00 | `build_pool.cmd`（gm 重建五池，需掘金终端运行） |
+| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：依次扫右侧/左侧/深水/T0/T1/持仓下穿，推送企业微信 |
+
+所有任务经 `run_hidden.vbs` 隐藏启动，不弹控制台窗口。
 
 注册命令（任务不存在或需重建时执行）：
 
 ```cmd
-schtasks /create /f /tn "fisher_建池" /tr "cmd /c \"cd /d D:\钓鱼 && .venv-gm\Scripts\pythonw.exe build_pool_gm.py\"" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
-schtasks /create /f /tn "fisher_扫描1031" /tr "\"D:\钓鱼\scan_all.cmd\"" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
+schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
+schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_all.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
 :: 1131 / 1401 / 1501 三条同上，仅改 /tn 与 /st
 ```
 
-结果 CSV 文件名带 `_right` / `_left` 后缀区分两个池。
+结果 CSV 文件名带 `_right` / `_left` / `_deep` / `_t0` / `_t1` / `_holdings` 后缀区分。
 
 ### 方式 B：常驻模式
 
