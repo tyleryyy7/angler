@@ -129,8 +129,8 @@ def signal_bar_index(df, now=None):
 
 
 def _sina_symbol(code):
-    """6 开头 -> sh，其余（00/30/68）-> sz。"""
-    return ("sh" if code.startswith("6") else "sz") + code
+    """新浪代码前缀：6/5(股票/沪ETF 51/58) -> sh，其余（00/30/68/15/16）-> sz。"""
+    return ("sh" if code.startswith(("5", "6")) else "sz") + code
 
 
 def fetch_60m(code):
@@ -266,6 +266,8 @@ def pool_label(args):
         return "左侧鱼塘"
     if "deep" in f:
         return "深水鱼塘"
+    if "t0" in f:
+        return "T0鱼塘"
     return "鱼塘"
 
 
@@ -280,6 +282,8 @@ def pool_tag(args):
         return "left"
     if "deep" in f:
         return "deep"
+    if "t0" in f:
+        return "t0"
     return ""
 
 

@@ -17,6 +17,9 @@ token 获取：掘金终端 -> 量化交易 -> token 管理。
     右侧：MACD DIF 连升两日 且 DIF > DEA 且 DIF > 0（零上趋势已成）
     左侧：MACD DIF 连升两日 且 DIF < DEA 且 DIF < 0（零下拐点埋伏）
     深水：无 MACD 闸门，日线 Fisher(9) < FISHER_DEEP_MAX
+    T+0 ETF 池（pool_t0.csv）：trade_n=0、剔联接/货币、上市满 120 天、
+          20 日均成交额 >= ETF_AVG_AMOUNT_MIN、20 日均振幅 >= ETF_AVG_AMPLITUDE_MIN，
+          无 MACD/Fisher 闸门（纯流动性+波动性筛选，进出靠 60 分钟信号）
 """
 
 import argparse
@@ -39,6 +42,10 @@ LIST_MIN_DAYS = 365           # 上市满 1 年
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 FISHER_LEN = 9
 FISHER_DEEP_MAX = -2.0        # 日线 Fisher 低于此值进深水池
+ETF_AVG_AMOUNT_MIN = 1e8      # T+0 ETF 池：20 日均成交额下限（元，ETF 量级小于股票）
+ETF_AVG_AMPLITUDE_MIN = 1.0   # T+0 ETF 池：20 日均振幅下限（%，天然淘汰债券/货币类）
+ETF_LIST_MIN_DAYS = 120       # T+0 ETF 上市最短天数
+OUT_T0 = "pool_t0.csv"
 RETRY = 3
 OUT_RIGHT = "pool_right.csv"
 OUT_LEFT = "pool_left.csv"
@@ -173,6 +180,64 @@ def classify(df):
     return avg_amount, avg_amp, float(d1), float(dea1), side, fisher_daily
 
 
+def fetch_etf_universe():
+    """T+0 ETF：trade_n=0，名称含 ETF、剔联接/货币，上市满 ETF_LIST_MIN_DAYS 天。"""
+    from gm.api import get_symbols
+    funds = get_symbols(1020, skip_suspended=True, skip_st=False, df=True)
+    t0 = funds[funds["trade_n"] == 0]
+    t0 = t0[t0["sec_name"].str.contains("ETF", na=False)]
+    t0 = t0[~t0["sec_name"].str.contains("联接|货币", na=False)]
+    t0 = t0[t0["symbol"].str.contains(r"^(SHSE|SZSE)")]
+    listed = pd.to_datetime(t0["listed_date"])
+    if getattr(listed.dt, "tz", None) is not None:
+        listed = listed.dt.tz_localize(None)
+    t0 = t0[listed <= datetime.now() - timedelta(days=ETF_LIST_MIN_DAYS)]
+    out = [{"code": s.split(".")[1], "name": n, "symbol": s}
+           for s, n in zip(t0["symbol"], t0["sec_name"])]
+    logging.info("T+0 ETF 初筛后 %d 只", len(out))
+    return out
+
+
+def classify_etf(df):
+    """ETF 池：只卡流动性 + 波动性，返回 (avg_amount, avg_amplitude) 或 None。"""
+    if df is None or len(df) < NEED_DAYS + 1:
+        return None
+    d = df.tail(NEED_DAYS + 1)
+    h = d["high"].astype(float).values
+    l = d["low"].astype(float).values
+    c = d["close"].astype(float).values
+    amt = pd.to_numeric(d["amount"], errors="coerce").values
+    avg_amp = ((h[1:] - l[1:]) / c[:-1] * 100).mean()
+    avg_amount = amt[1:].mean()
+    if avg_amount >= ETF_AVG_AMOUNT_MIN and avg_amp >= ETF_AVG_AMPLITUDE_MIN:
+        return avg_amount, avg_amp
+    return None
+
+
+def build_t0_pool():
+    """构建 T+0 ETF 池并写 pool_t0.csv。"""
+    t0 = []
+    fails = 0
+    universe = fetch_etf_universe()
+    t_start = time.time()
+    for i, item in enumerate(universe):
+        df = fetch_daily(item["symbol"])
+        if df is None:
+            fails += 1
+        else:
+            r = classify_etf(df)
+            if r:
+                t0.append({
+                    "code": item["code"], "name": item["name"],
+                    "close": float(df["close"].iloc[-1]),
+                    "avg_amount": round(r[0] / 1e8, 2),
+                    "avg_amplitude": round(r[1], 2),
+                })
+    pd.DataFrame(t0).to_csv(OUT_T0, index=False, encoding="utf-8-sig")
+    logging.info("T+0 ETF 池完成：%d 只入池 -> %s，失败 %d，耗时 %.1f 秒",
+                 len(t0), OUT_T0, fails, time.time() - t_start)
+
+
 def save_results(right, left, deep):
     pd.DataFrame(right).to_csv(OUT_RIGHT, index=False, encoding="utf-8-sig")
     pd.DataFrame(left).to_csv(OUT_LEFT, index=False, encoding="utf-8-sig")
@@ -245,6 +310,8 @@ def main():
     logging.info("完成：%d 只耗时 %.1f 分钟，右侧 %d 只 -> %s，左侧 %d 只 -> %s，深水 %d 只 -> %s，失败 %d 只",
                  n, (time.time() - t0) / 60,
                  len(right), OUT_RIGHT, len(left), OUT_LEFT, len(deep), OUT_DEEP, fails)
+
+    build_t0_pool()   # T+0 ETF 池（pool_t0.csv）
 
 
 if __name__ == "__main__":
