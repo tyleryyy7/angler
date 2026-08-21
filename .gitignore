@@ -1,10 +1,12 @@
 # Python
 .venv/
+.venv-gm/
 __pycache__/
 *.pyc
 
-# 密钥（企业微信 webhook，切勿提交）
+# 密钥（企业微信 webhook / 掘金 token，切勿提交）
 webhook.key
+gm_token.key
 
 # 个人持仓
 holdings.csv
@@ -12,5 +14,6 @@ holdings.csv
 # 生成的数据与日志
 pool*.csv
 dual_progress.txt
+gm_progress.txt
 results/
 scanner.log

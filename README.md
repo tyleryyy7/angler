@@ -11,13 +11,6 @@
   全市场行情为分页拉取（约 1 分钟），频繁重复调用会被新浪暂时封 IP，`--loop` 模式每日只刷一次，无此问题。
 - `"em"`（东方财富，原实现）：若你的网络能正常访问东财接口，可切回，速度更快。
 
-## 推送配置（企业微信机器人）
-
-扫描结果可推送到微信：注册免费企业微信 → 建群 → 添加群机器人 → 复制 webhook 地址。
-然后在项目目录新建 `webhook.key` 文件，把 webhook 地址粘贴进去（一行），
-或设置环境变量 `FISHER_WECOM_WEBHOOK`。`webhook.key` 已在 .gitignore 中，不会上传。
-留空则不推送，只打印到控制台。
-
 ## 信号定义
 
 与你的 TradingView Pine 代码 / 同花顺公式完全一致：
@@ -34,7 +27,8 @@ A 股 60 分钟 bar 一天 4 根，东财时间戳为 bar **结束**时刻：10:
 fisher_60min_scanner/
 ├── fisher_scanner.py    # 主程序（配置区在文件头部，参数可调）
 ├── build_pool.py        # 预筛股票池生成器（旧方案，已弃用留档）
-├── build_pool_dual.py   # 右侧/左侧双池生成器（含 MACD 条件，生成 pool_right.csv / pool_left.csv）
+├── build_pool_dual.py   # 三池生成器（新浪版，备用）
+├── build_pool_gm.py     # 三池生成器（掘金 gm 版，当前默认；跑在 .venv-gm）
 ├── scan_all.cmd         # 定时任务入口：右侧池 + 左侧池 + 持仓下穿 依次扫描
 ├── holdings.csv         # 持仓清单（--buy 登记，下穿监控对象）
 ├── requirements.txt     # 依赖
@@ -60,21 +54,39 @@ python fisher_scanner.py --once --pool-file pool.csv
 注意：新浪日线没有成交额字段，脚本用「成交量 × 典型价」近似，临界票可能有少量出入。
 `pool.csv` 中的 `avg_amount`（亿元）/`avg_amplitude`（%）两列供人工核对，扫描器只读 code/name。
 
-### 方案一：右侧 / 左侧双池（build_pool_dual.py）
+### 方案一：右侧 / 左侧 / 深水 三池（build_pool_gm.py，掘金版）
 
-更严格的盘后双池（夜间运行，约 30~40 分钟）：
+三池构建现用掘金 gm 数据源（需掘金终端运行并登录，token 在 `gm_token.key`）：
 
 ```bash
-python build_pool_dual.py
-# 盘中按策略选用其一：
+.venv-gm\Scripts\python.exe build_pool_gm.py            # 全量（约几分钟，走本地终端，极快）
+.venv-gm\Scripts\python.exe build_pool_gm.py --resume   # 断点续跑
+# 备用：新浪版（终端不可用时）
+.venv\Scripts\python.exe build_pool_dual.py
+```
+
+gm 版改进：自带剔 ST/停牌、按上市日期精确过滤满 1 年、真实成交额、前复权日线；
+无新浪限流风险。分类逻辑与新浪版完全一致。
+
+```bash
+# 盘中按策略选用（scan_all.cmd 已含全部三个池 + 持仓监控）：
 python fisher_scanner.py --once --pool-file pool_right.csv   # 右侧
 python fisher_scanner.py --once --pool-file pool_left.csv    # 左侧
+python fisher_scanner.py --once --pool-file pool_deep.csv    # 深水
 ```
 
 公共条件：仅沪深主板（剔创业板/科创板/北交所）、非 ST/退、非停牌、股价 ≥ 2 元、
-20 日均成交额 ≥ 2 亿、20 日均振幅 ≥ 2.5%、上市满 1 年。
-MACD（12/26/9，前复权日线）：DIF 连续两日上升；**右侧池** DIF > DEA，**左侧池** DIF < DEA。
-数据走新浪前复权日线（含真实成交额，无近似），输出含 dif/dea 等核对列。
+20 日均成交额 ≥ 2 亿、20 日均振幅 ≥ 2.5%、上市满 1 年。输出含 dif/dea/fisher_daily 核对列。
+
+三个池的分化条件：
+
+| 池 | 条件 | 思路 |
+|---|---|---|
+| 右侧 pool_right.csv | MACD DIF 连升两日且 DIF > DEA | 趋势已成，追随 |
+| 左侧 pool_left.csv | MACD DIF 连升两日且 DIF < DEA | 拐点将至，埋伏 |
+| 深水 pool_deep.csv（实验） | 无 MACD 闸门，日线 Fisher < -2 | 深度超卖反弹 |
+
+注意：日线 Fisher 以凌晨建池时的上一交易日收盘为准，盘中固定不变。
 
 ### 持仓监控（下穿预警）
 
@@ -121,13 +133,13 @@ Windows 已在「任务计划程序」注册 5 个任务（用 `schtasks /query 
 
 | 任务名 | 触发 | 动作 |
 |---|---|---|
-| `fisher_建池` | 工作日 00:00 | `build_pool_dual.py` 重建双池（pool_right.csv / pool_left.csv） |
-| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | 运行 `scan_all.cmd`：依次扫右侧池、左侧池、持仓（下穿），推送企业微信 |
+| `fisher_建池` | 工作日 00:00 | `build_pool_gm.py` 重建三池（pool_right/left/deep.csv，掘金数据源，需终端运行） |
+| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | 运行 `scan_all.cmd`：依次扫右侧池、左侧池、深水池、持仓（下穿），推送企业微信 |
 
 注册命令（任务不存在或需重建时执行）：
 
 ```cmd
-schtasks /create /f /tn "fisher_建池" /tr "cmd /c \"cd /d D:\钓鱼 && .venv\Scripts\pythonw.exe build_pool_dual.py\"" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
+schtasks /create /f /tn "fisher_建池" /tr "cmd /c \"cd /d D:\钓鱼 && .venv-gm\Scripts\pythonw.exe build_pool_gm.py\"" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
 schtasks /create /f /tn "fisher_扫描1031" /tr "\"D:\钓鱼\scan_all.cmd\"" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
 :: 1131 / 1401 / 1501 三条同上，仅改 /tn 与 /st
 ```
@@ -154,8 +166,9 @@ python fisher_scanner.py --loop
 | close | 该 bar 收盘价（前复权） |
 | fisher / trigger | 该 bar 的 Fisher / Trigger 值 |
 
-推送已内置：扫描结果通过**企业微信机器人**推送到微信（webhook 配置在 `fisher_scanner.py`
-配置区 `WECOM_WEBHOOK`，留空则关闭推送；`PUSH_EMPTY=False` 可让无命中时不打扰）。
+推送已内置：扫描结果通过**企业微信机器人**推送到微信。配置方式：把 webhook 地址写入项目目录的
+`webhook.key` 文件（一行，已在 .gitignore 中），或设置环境变量 `FISHER_WECOM_WEBHOOK`；
+两者都没有则不推送。`PUSH_EMPTY=False` 可让上穿池无命中时不打扰（持仓下穿本就无命中不推送）。
 
 ## 重要注意事项
 

@@ -256,7 +256,7 @@ def scan(pool, save=True, label="", side="up"):
 
 
 def pool_label(args):
-    """从股票池文件名推断鱼塘：pool_right/left.csv -> 右侧/左侧鱼塘，holdings.csv -> 持仓鱼塘。"""
+    """从股票池文件名推断鱼塘：pool_right/left/deep.csv -> 右侧/左侧/深水鱼塘，holdings.csv -> 持仓鱼塘。"""
     f = (args.pool_file or "").lower()
     if "holding" in f:
         return "持仓鱼塘"
@@ -264,6 +264,8 @@ def pool_label(args):
         return "右侧鱼塘"
     if "left" in f:
         return "左侧鱼塘"
+    if "deep" in f:
+        return "深水鱼塘"
     return "鱼塘"
 
 
@@ -276,6 +278,8 @@ def pool_tag(args):
         return "right"
     if "left" in f:
         return "left"
+    if "deep" in f:
+        return "deep"
     return ""
 
 

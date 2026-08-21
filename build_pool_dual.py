@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-右侧 / 左侧双股票池生成器（沪深主板，新浪数据源，盘后运行）
+右侧 / 左侧 / 深水 三股票池生成器（沪深主板，新浪数据源，盘后运行）
 
 公共过滤条件：
     沪深主板（60/00 开头；剔创业板 30、科创板 68、北交所）
@@ -16,11 +16,15 @@ MACD（12/26/9，前复权日线收盘，EMA 递推口径与通达信/同花顺�
     DIF < DEA  → 左侧交易池 pool_left.csv
     DIF == DEA → 两边都不入
 
+深水池（实验性，无 MACD 闸门）：
+    日线 Fisher(FISHER_LEN) 最新值 < FISHER_DEEP_MAX（深度超卖）→ pool_deep.csv
+    与右侧/左侧池独立，允许重叠。
+
 用法：
-    python build_pool_dual.py                 # 生成 pool_right.csv / pool_left.csv
+    python build_pool_dual.py                 # 生成 pool_right.csv / pool_left.csv / pool_deep.csv
     python build_pool_dual.py --limit 100     # 调试：只处理粗筛后前 100 只
 
-注意：请在收盘后运行（盘中运行时当日日 bar 未完结，会参与均值和 MACD 计算）。
+注意：请在收盘后运行（盘中运行时当日日 bar 未完结，会参与均值、MACD 和日线 Fisher 计算）。
 """
 
 import argparse
@@ -38,10 +42,12 @@ AVG_AMPLITUDE_MIN = 2.5       # 20 日均振幅下限（%）
 NEED_DAYS = 20                # 均值窗口（交易日）
 LIST_MIN_BARS = 245           # 上市满 1 年的近似 bar 数（一年约 242 个交易日）
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
+FISHER_DEEP_MAX = -2.0        # 日线 Fisher 低于此值进深水池（深度超卖）
 REQUEST_INTERVAL = 0.2        # 每股请求间隔（秒），防新浪限流
 RETRY = 3
 OUT_RIGHT = "pool_right.csv"
 OUT_LEFT = "pool_left.csv"
+OUT_DEEP = "pool_deep.csv"
 PROGRESS_FILE = Path(__file__).resolve().parent / "dual_progress.txt"  # 断点：每行一个已处理 code
 SAVE_EVERY = 200              # 每处理 N 只增量落盘一次（防中途卡死丢进度）
 # -----------------------------------------------------------------
@@ -89,7 +95,11 @@ def macd(close):
 
 
 def classify(df):
-    """返回 (avg_amount, avg_amplitude, dif, dea, side)，side 为 'right'/'left'/None。"""
+    """返回 (avg_amount, avg_amplitude, dif, dea, side, fisher_daily)。
+
+    side 为 'right'/'left'/None（MACD 条件不满足时为 None）；fisher_daily 为最新日线 Fisher 值，
+    供深水池判定（不依赖 MACD）。基础过滤不通过返回 None。
+    """
     if df is None or len(df) < LIST_MIN_BARS:   # 上市不足一年
         return None
     close = df["close"].astype(float).reset_index(drop=True)
@@ -104,15 +114,19 @@ def classify(df):
     if not (avg_amount >= AVG_AMOUNT_MIN and avg_amp >= AVG_AMPLITUDE_MIN):
         return None
 
+    # 日线 Fisher（与 60 分钟同一套实现，hl2 递归）
+    from fisher_scanner import fisher_transform, FISHER_LEN
+    fish, _ = fisher_transform(df["high"].astype(float).values,
+                               df["low"].astype(float).values, FISHER_LEN)
+    fisher_daily = float(fish[-1])
+
     dif, dea = macd(close)
     d1, d2, d3 = dif.iloc[-1], dif.iloc[-2], dif.iloc[-3]
     dea1 = dea.iloc[-1]
-    if not (d1 > d2 > d3):
-        return None
-    side = "right" if d1 > dea1 else ("left" if d1 < dea1 else None)
-    if side is None:
-        return None
-    return avg_amount, avg_amp, float(d1), float(dea1), side
+    side = None
+    if d1 > d2 > d3:
+        side = "right" if d1 > dea1 else ("left" if d1 < dea1 else None)
+    return avg_amount, avg_amp, float(d1), float(dea1), side, fisher_daily
 
 
 def coarse_filter():
@@ -131,9 +145,10 @@ def coarse_filter():
     return pool
 
 
-def save_results(right, left):
+def save_results(right, left, deep):
     pd.DataFrame(right).to_csv(OUT_RIGHT, index=False, encoding="utf-8-sig")
     pd.DataFrame(left).to_csv(OUT_LEFT, index=False, encoding="utf-8-sig")
+    pd.DataFrame(deep).to_csv(OUT_DEEP, index=False, encoding="utf-8-sig")
 
 
 def main():
@@ -148,19 +163,19 @@ def main():
         pool = pool.head(args.limit)
         logging.info("调试模式：只处理前 %d 只", len(pool))
 
-    right, left, done = [], [], set()
+    right, left, deep, done = [], [], [], set()
     if args.resume:
         if PROGRESS_FILE.exists():
             done = set(PROGRESS_FILE.read_text(encoding="utf-8").split())
-        for path, lst in ((OUT_RIGHT, right), (OUT_LEFT, left)):
+        for path, lst in ((OUT_RIGHT, right), (OUT_LEFT, left), (OUT_DEEP, deep)):
             p = Path(path)
             if p.exists() and p.stat().st_size > 0:
                 old = pd.read_csv(p, dtype={"code": str})
                 lst.extend(old.to_dict("records"))
-        logging.info("断点续跑：跳过已处理 %d 只，已有右侧 %d / 左侧 %d",
-                     len(done), len(right), len(left))
+        logging.info("断点续跑：跳过已处理 %d 只，已有右侧 %d / 左侧 %d / 深水 %d",
+                     len(done), len(right), len(left), len(deep))
 
-    right_new, left_new, fails = len(right), len(left), 0
+    fails = 0
     t0 = time.time()
     n = len(pool)
     processed = 0
@@ -181,22 +196,27 @@ def main():
                         "avg_amount": round(r[0] / 1e8, 2),   # 亿元
                         "avg_amplitude": round(r[1], 2),       # %
                         "dif": round(r[2], 4), "dea": round(r[3], 4),
+                        "fisher_daily": round(r[5], 3),
                     }
-                    (right if r[4] == "right" else left).append(rec)
+                    if r[4] == "right":
+                        right.append(rec)
+                    elif r[4] == "left":
+                        left.append(rec)
+                    if r[5] < FISHER_DEEP_MAX:
+                        deep.append(rec)
             prog.write(code + "\n")
             prog.flush()
             processed += 1
             if processed % SAVE_EVERY == 0:
-                logging.info("进度 %d/%d，右侧 %d，左侧 %d，失败 %d",
-                             i + 1, n, len(right), len(left), fails)
-                save_results(right, left)
+                logging.info("进度 %d/%d，右侧 %d，左侧 %d，深水 %d，失败 %d",
+                             i + 1, n, len(right), len(left), len(deep), fails)
+                save_results(right, left, deep)
             time.sleep(REQUEST_INTERVAL)
 
-    save_results(right, left)
-    logging.info("完成：%d 只耗时 %.1f 分钟，右侧 %d 只（新增 %d）-> %s，左侧 %d 只（新增 %d）-> %s，失败 %d 只",
+    save_results(right, left, deep)
+    logging.info("完成：%d 只耗时 %.1f 分钟，右侧 %d 只 -> %s，左侧 %d 只 -> %s，深水 %d 只 -> %s，失败 %d 只",
                  n, (time.time() - t0) / 60,
-                 len(right), len(right) - right_new, OUT_RIGHT,
-                 len(left), len(left) - left_new, OUT_LEFT, fails)
+                 len(right), OUT_RIGHT, len(left), OUT_LEFT, len(deep), OUT_DEEP, fails)
 
 
 if __name__ == "__main__":
