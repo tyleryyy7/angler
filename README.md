@@ -94,9 +94,11 @@ python fisher_scanner.py --once --pool-file pool_deep.csv    # 深水
 
 | 池 | 条件 | 思路 |
 |---|---|---|
-| 右侧 pool_right.csv | MACD DIF 连升两日且 DIF > DEA | 趋势已成，追随 |
-| 左侧 pool_left.csv | MACD DIF 连升两日且 DIF < DEA | 拐点将至，埋伏 |
+| 右侧 pool_right.csv | MACD DIF 连升两日 且 DIF > DEA 且 **DIF > 0** | 零上趋势已成，追随 |
+| 左侧 pool_left.csv | MACD DIF 连升两日 且 DIF < DEA 且 **DIF < 0** | 零下拐点将至，埋伏 |
 | 深水 pool_deep.csv（实验） | 无 MACD 闸门，日线 Fisher < -2 | 深度超卖反弹 |
+
+（零上回调 DIF>0 但 DIF<DEA、零下反弹 DIF<0 但 DIF>DEA 的中间态两边都不入。）
 
 注意：日线 Fisher 以凌晨建池时的上一交易日收盘为准，盘中固定不变。
 

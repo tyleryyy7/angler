@@ -12,9 +12,9 @@
 
 MACD（12/26/9，前复权日线收盘，EMA 递推口径与通达信/同花顺一致）：
     要求 DIF 连续上升：DIF[-1] > DIF[-2] > DIF[-3]
-    DIF > DEA  → 右侧交易池 pool_right.csv
-    DIF < DEA  → 左侧交易池 pool_left.csv
-    DIF == DEA → 两边都不入
+    DIF > DEA 且 DIF > 0 → 右侧交易池 pool_right.csv（零上趋势已成）
+    DIF < DEA 且 DIF < 0 → 左侧交易池 pool_left.csv（零下拐点埋伏）
+    其余（零上回调、零下反弹、DIF==DEA）两边都不入
 
 深水池（实验性，无 MACD 闸门）：
     日线 Fisher(FISHER_LEN) 最新值 < FISHER_DEEP_MAX（深度超卖）→ pool_deep.csv
@@ -125,7 +125,10 @@ def classify(df):
     dea1 = dea.iloc[-1]
     side = None
     if d1 > d2 > d3:
-        side = "right" if d1 > dea1 else ("left" if d1 < dea1 else None)
+        if d1 > dea1 and d1 > 0:        # 右侧：零上，DIF 在 DEA 上方走强
+            side = "right"
+        elif d1 < dea1 and d1 < 0:      # 左侧：零下，DIF 拐头向 DEA 靠近
+            side = "left"
     return avg_amount, avg_amp, float(d1), float(dea1), side, fisher_daily
 
 

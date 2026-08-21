@@ -14,8 +14,8 @@ token 获取：掘金终端 -> 量化交易 -> token 管理。
     公共：沪深主板（SHSE.60 / SZSE.00）、剔 ST/停牌（get_symbols 自带）、
           上市满 1 年（listed_date 精确判定）、最新收盘 >= MIN_PRICE、
           20 日均成交额 >= AVG_AMOUNT_MIN、20 日均振幅 >= AVG_AMPLITUDE_MIN
-    右侧：MACD DIF 连升两日且 DIF > DEA
-    左侧：MACD DIF 连升两日且 DIF < DEA
+    右侧：MACD DIF 连升两日 且 DIF > DEA 且 DIF > 0（零上趋势已成）
+    左侧：MACD DIF 连升两日 且 DIF < DEA 且 DIF < 0（零下拐点埋伏）
     深水：无 MACD 闸门，日线 Fisher(9) < FISHER_DEEP_MAX
 """
 
@@ -166,7 +166,10 @@ def classify(df):
     dea1 = dea.iloc[-1]
     side = None
     if d1 > d2 > d3:
-        side = "right" if d1 > dea1 else ("left" if d1 < dea1 else None)
+        if d1 > dea1 and d1 > 0:        # 右侧：零上，DIF 在 DEA 上方走强
+            side = "right"
+        elif d1 < dea1 and d1 < 0:      # 左侧：零下，DIF 拐头向 DEA 靠近
+            side = "left"
     return avg_amount, avg_amp, float(d1), float(dea1), side, fisher_daily
 
 
