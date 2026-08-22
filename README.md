@@ -26,13 +26,13 @@ A 股 60 分钟 bar 一天 4 根，东财时间戳为 bar **结束**时刻：10:
 ```
 fisher_60min_scanner/
 ├── fisher_scanner.py    # 主程序（配置区在文件头部，参数可调）
-├── build_pool.py        # 预筛股票池生成器（旧方案，已弃用留档）
+├── build_pool_gm.py     # 五池生成器（掘金 gm 版，当前默认；跑在 .venv-gm）
 ├── build_pool_dual.py   # 三池生成器（新浪版，备用）
-├── build_pool_gm.py     # 三池生成器（掘金 gm 版，当前默认；跑在 .venv-gm）
 ├── scan_all.cmd         # 定时任务入口：五个池 + 持仓下穿 依次扫描
 ├── build_pool.cmd       # 建池任务入口（gm 版）
 ├── run_hidden.vbs       # 隐藏控制台启动器（计划任务经它调用 .cmd，不弹窗）
 ├── holdings.csv         # 持仓清单（--buy 登记，下穿监控对象）
+├── AGENTS.md            # AI 助手交接文档
 ├── requirements.txt     # 依赖
 ├── 使用说明.md          # 本文件
 ├── results/             # 扫描结果 CSV（运行后自动生成）
@@ -41,20 +41,19 @@ fisher_60min_scanner/
 
 ## 每日工作流（推荐）
 
-新浪源全市场扫描较慢（约 4 秒/只），盘中务必用预筛池：
+全自动：Windows 计划任务工作日 00:00 建池（gm 版），盘中 10:31/11:31/14:01/15:01
+扫描全部五个池 + 持仓下穿并推送企业微信（见下文「正式运行」）。
+
+手动命令：
 
 ```bash
-# 收盘后（15:30 之后，新浪日线收盘数据更新完毕）运行一次，生成 pool.csv
-python build_pool.py
+# 建池（掘金 gm 版，约 1 分钟；需掘金终端运行并登录）
+.venv-gm\Scripts\python.exe build_pool_gm.py
 
-# 盘中扫描用预筛池
-python fisher_scanner.py --once --pool-file pool.csv
+# 盘中扫描（按池选用）
+.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv
+.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_deep.csv
 ```
-
-预筛条件（`build_pool.py` 配置区可调）：沪深 A 股、剔 ST/退市、剔停牌（当日无成交）、
-剔股价 < 2 元、20 日均成交额 ≥ 2 亿、20 日均振幅 ≥ 2.5%。
-注意：新浪日线没有成交额字段，脚本用「成交量 × 典型价」近似，临界票可能有少量出入。
-`pool.csv` 中的 `avg_amount`（亿元）/`avg_amplitude`（%）两列供人工核对，扫描器只读 code/name。
 
 ### 方案一：右侧 / 左侧 / 深水 / T0 / T1 五池构建（两个数据源任选）
 
@@ -77,25 +76,25 @@ python -m venv .venv-gm                                    # 首次：独立环�
 
 ```bash
 pip install -r requirements.txt
-python build_pool_dual.py            # 全量约 90 分钟，建议夜间运行
-python build_pool_dual.py --resume   # 断点续跑
+.venv\Scripts\python.exe build_pool_dual.py            # 全量约 90 分钟，建议夜间运行
+.venv\Scripts\python.exe build_pool_dual.py --resume   # 断点续跑
 ```
 
 两个方案的过滤/分类逻辑完全一致，输出可互相替换：
 
 ```bash
 # 盘中按策略选用（scan_all.cmd 已含全部五个池 + 持仓监控）：
-python fisher_scanner.py --once --pool-file pool_right.csv   # 右侧
-python fisher_scanner.py --once --pool-file pool_left.csv    # 左侧
-python fisher_scanner.py --once --pool-file pool_deep.csv    # 深水
-python fisher_scanner.py --once --pool-file pool_t0.csv      # T+0 ETF
-python fisher_scanner.py --once --pool-file pool_t1.csv      # T+1 ETF
+.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv   # 右侧
+.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_left.csv    # 左侧
+.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_deep.csv    # 深水
+.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_t0.csv      # T+0 ETF
+.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_t1.csv      # T+1 ETF
 ```
 
 公共条件：仅沪深主板（剔创业板/科创板/北交所）、非 ST/退、非停牌、股价 ≥ 2 元、
 20 日均成交额 ≥ 2 亿、20 日均振幅 ≥ 2.5%、上市满 1 年。输出含 dif/dea/fisher_daily 核对列。
 
-三个池的分化条件：
+五个池的分化条件：
 
 | 池 | 条件 | 思路 |
 |---|---|---|
@@ -114,14 +113,14 @@ python fisher_scanner.py --once --pool-file pool_t1.csv      # T+1 ETF
 买入后登记到 `holdings.csv`（或直接告诉我帮你登记）：
 
 ```bash
-python fisher_scanner.py --buy 600036 --price 38.86   # --price 可省，缺省取最新价
+.venvScriptspython.exe fisher_scanner.py --buy 600036 --price 38.86   # --price 可省，缺省取最新价
 ```
 
 盘中持仓随 4 个时点任务自动监控 60 分钟**下穿**（由升转跌拐点），命中推送
 「持仓鱼塘：N 条鱼下穿」；无命中不推送（避免噪音）。手动触发：
 
 ```bash
-python fisher_scanner.py --once --pool-file holdings.csv --side down
+.venvScriptspython.exe fisher_scanner.py --once --pool-file holdings.csv --side down
 ```
 
 卖出后编辑 `holdings.csv` 删掉对应行即可。
@@ -132,7 +131,7 @@ python fisher_scanner.py --once --pool-file holdings.csv --side down
 pip install -r requirements.txt
 
 # 先小规模测试（只扫前 50 只，验证环境）
-python fisher_scanner.py --once --limit 50
+.venvScriptspython.exe fisher_scanner.py --once --limit 50
 ```
 
 ## 正式运行（两种方式选一）
@@ -142,12 +141,12 @@ python fisher_scanner.py --once --limit 50
 每根 bar 收盘后 1 分钟各跑一次：
 
 ```cron
-# Linux crontab（周一到周五）；第一行为盘前重建预筛池（用前一交易日收盘数据）
-30 8  * * 1-5  cd /路径/fisher_60min_scanner && /usr/bin/python3 build_pool.py
-31 10 * * 1-5  cd /路径/fisher_60min_scanner && /usr/bin/python3 fisher_scanner.py --once --pool-file pool.csv
-31 11 * * 1-5  cd /路径/fisher_60min_scanner && /usr/bin/python3 fisher_scanner.py --once --pool-file pool.csv
-1  14 * * 1-5  cd /路径/fisher_60min_scanner && /usr/bin/python3 fisher_scanner.py --once --pool-file pool.csv
-1  15 * * 1-5  cd /路径/fisher_60min_scanner && /usr/bin/python3 fisher_scanner.py --once --pool-file pool.csv
+# Linux crontab（周一到周五）；第一行为凌晨建池（用前一交易日收盘数据）
+0  0  * * 1-5  cd /路径 && /usr/bin/python3 build_pool_dual.py
+31 10 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
+31 11 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
+1  14 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
+1  15 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
 ```
 
 Windows 已在「任务计划程序」注册 5 个任务（用 `schtasks /query | findstr fisher` 查看）：
@@ -172,7 +171,7 @@ schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hid
 ### 方式 B：常驻模式
 
 ```bash
-python fisher_scanner.py --loop
+.venvScriptspython.exe fisher_scanner.py --loop
 ```
 
 进程常驻，工作日 10:31 / 11:31 / 14:01 / 15:01 自动扫描（注意：此模式只按星期判断，

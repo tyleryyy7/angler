@@ -155,7 +155,7 @@ def save_results(right, left, deep):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="右侧/左侧双股票池生成器")
+    parser = argparse.ArgumentParser(description="右侧/左侧/深水三池生成器（新浪版，备用）")
     parser.add_argument("--limit", type=int, help="只处理粗筛后前 N 只（调试）")
     parser.add_argument("--resume", action="store_true",
                         help="断点续跑：跳过 dual_progress.txt 中已处理的票，并合并已有 CSV 结果")

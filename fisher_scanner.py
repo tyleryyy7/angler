@@ -195,12 +195,14 @@ def load_pool(args):
 
 
 def scan_one(row, side="up"):
-    """扫描单只股票，命中返回 dict，未命中返回 None，拉取失败返回 'FAIL'。"""
+    """扫描单只股票：命中返回 dict；未命中 None；拉取失败 'FAIL'；bar 不足 'SKIP'。"""
     code, name = str(row["code"]), row["name"]
     df = fetch_60m(code)
     time.sleep(REQUEST_INTERVAL)   # 每个 worker 内部的节流
-    if df is None or len(df) < MIN_BARS:
+    if df is None:
         return "FAIL"
+    if len(df) < MIN_BARS:
+        return "SKIP"
     high = pd.to_numeric(df["最高"], errors="coerce").values
     low = pd.to_numeric(df["最低"], errors="coerce").values
     fish, trig = fisher_transform(high, low, FISHER_LEN)
@@ -224,7 +226,7 @@ def scan(pool, save=True, label="", side="up"):
     多线程下会崩解释器；多进程各自独立则无此问题。
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    hits, fails, done = [], 0, 0
+    hits, fails, skips, done = [], 0, 0, 0
     t0 = time.time()
     n = len(pool)
     rows = [row for _, row in pool.iterrows()]
@@ -235,17 +237,19 @@ def scan(pool, save=True, label="", side="up"):
             done += 1
             if r == "FAIL":
                 fails += 1
+            elif r == "SKIP":
+                skips += 1
             elif r:
                 hits.append(r)
             if done % 50 == 0:
-                logging.info("进度 %d/%d，命中 %d，失败 %d", done, n, len(hits), fails)
+                logging.info("进度 %d/%d，命中 %d，失败 %d，跳过 %d", done, n, len(hits), fails, skips)
 
     result = pd.DataFrame(hits)
     if len(result):
         result = result.sort_values("code").reset_index(drop=True)
     elapsed = time.time() - t0
-    logging.info("扫描完成：%d 只耗时 %.1f 分钟，命中 %d 只，失败 %d 只",
-                 n, elapsed / 60, len(result), fails)
+    logging.info("扫描完成：%d 只耗时 %.1f 分钟，命中 %d 只，失败 %d 只，跳过 %d 只",
+                 n, elapsed / 60, len(result), fails, skips)
     if save:
         RESULT_DIR.mkdir(exist_ok=True)
         tag = "_%s" % label if label else ""

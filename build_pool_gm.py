@@ -108,13 +108,20 @@ def fetch_universe():
 
     cutoff = datetime.now() - timedelta(days=LIST_MIN_DAYS)
     out = []
+    batch_fails = 0
     symbols = stocks["symbol"].tolist()
     for k in range(0, len(symbols), 200):          # get_instruments 分批
         batch = symbols[k:k + 200]
-        try:
-            info = get_instruments(symbols=batch, df=True)
-        except Exception as e:
-            logging.warning("get_instruments 批次失败: %s", e)
+        info = None
+        for attempt in range(2):                    # 失败重试一次，避免整批 200 只被静默丢弃
+            try:
+                info = get_instruments(symbols=batch, df=True)
+                break
+            except Exception as e:
+                logging.warning("get_instruments 批次 %d 第 %d 次失败: %s", k // 200, attempt + 1, e)
+                time.sleep(1.0)
+        if info is None:
+            batch_fails += 1
             continue
         listed = pd.to_datetime(info["listed_date"])
         if getattr(listed.dt, "tz", None) is not None:
@@ -125,6 +132,8 @@ def fetch_universe():
             name = r.get("sec_name", "")
             out.append({"code": code, "name": name, "symbol": r["symbol"]})
         time.sleep(0.1)
+    if batch_fails:
+        logging.warning("get_instruments 共 %d 个批次最终失败（约 %d 只被跳过）", batch_fails, batch_fails * 200)
     logging.info("上市满 1 年后剩余 %d 只", len(out))
     return out
 
