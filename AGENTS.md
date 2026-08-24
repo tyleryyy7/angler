@@ -9,13 +9,14 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 ## 文件结构
 
 - `fisher_scanner.py` — 主扫描器（主环境 `.venv` 运行）。信号定义、上穿/下穿判定、
-  并发扫描、企业微信推送。配置区在文件头部。
+  并发扫描、企业微信推送、多数据源（tdx/sina/gm/em）。配置区在文件头部。
+- `run_scan.py` — 盘中扫描调度器（`.venv` 运行）：依次扫五池+持仓下穿，通道降级切换。
 - `build_pool_gm.py` — 建池（掘金 gm 版，**当前默认**，`.venv-gm` 运行）。
   产出 pool_right.csv / pool_left.csv / pool_deep.csv / pool_t0.csv / pool_t1.csv。
 - `build_pool_dual.py` — 建池（新浪版，**备用**，主环境 `.venv` 运行）。
   gm 不可用时切回，输出文件名相同。
 - `build_pool.py` — 已删除（旧单池方案，git 历史可查）。
-- `scan_all.cmd` — 盘中扫描入口：依次扫 右侧/左侧/深水/T0/T1/持仓下穿（CRLF 换行，勿改 LF）。
+- `scan_all.cmd` — 盘中扫描入口：调用 run_scan.py（CRLF 换行，勿改 LF）。
 - `build_pool.cmd` — 建池任务入口（CRLF）。
 - `run_hidden.vbs` — 隐藏控制台启动器，所有计划任务经它调用 .cmd（防弹窗）。
 - `holdings.csv` — 用户持仓（code,name,buy_date,buy_price），gitignore。
@@ -49,10 +50,23 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 - 任务经 run_hidden.vbs 隐藏运行。
 - 重建命令见 使用说明.md。查询：`schtasks /query | findstr fisher`
 
+## 数据通道（降级链：tdx → sina → gm）
+
+- **tdx（默认）**：xmtdx 库（通达信 TCP 协议，纯标准库，主环境 .venv），快、无限流、
+  不需要 akshare；缺点是不复权（除权日可能有少量假信号）。
+  注意：tdx 盘中第二根 60m bar 会标 13:00（跨午休怪癖），fetch 时按「当日第几根」
+  映射到 10:30/11:30/14:00/15:00 收盘时刻，勿改回原始时间戳。
+- **sina**：akshare，前复权准，但会限流（HTTP 456，冷却几十分钟自愈）。
+- **gm**：掘金，须 .venv-gm 且终端运行；免费版 60m 历史有配额（报 status 1014），只作兜底。
+- **em（东财）**：push2his K 线接口被本机网络 WAF 按 TLS 指纹封锁，不可用。
+
+`run_scan.py` 是盘中扫描调度器：依次扫 5 个池 + 持仓下穿，通道失败率 >50% 自动降级。
+`fisher_scanner.py --source tdx|sina|gm|em` 可手动指定通道。
+
 ## 踩过的坑（改代码前必读）
 
-1. **东财接口（push2.eastmoney.com）被本机网络 WAF 封锁**（按 TLS 指纹/IP），
-   Python 任何 TLS 栈都不通，故默认数据源是新浪（`DATA_SOURCE = "sina"`）。勿轻易切回 em。
+1. **东财接口（push2his.eastmoney.com K线）被本机网络 WAF 封锁**（按 TLS 指纹/IP），
+   Python 任何 TLS 栈都不通。勿轻易切回 em。
 2. **py_mini_racer 多线程会崩解释器**（akshare 新浪前复权链路依赖它）：
    fisher_scanner.py 的并发必须用**进程池**（ProcessPoolExecutor），勿改线程池。
 3. **akshare 内部请求无超时**，曾导致任务挂死 2 小时：
@@ -63,10 +77,12 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 6. 新浪限流：每股请求间隔 ≥ 0.2s；全市场快照（stock_zh_a_spot）每天只调一次。
    分钟线接口超限会返回 HTTP 456（akshare 表现为 list index out of range），
    冷却几十分钟自愈。扫描失败率 >50% 时 notify 会推「数据源异常」而非「0 条鱼」。
-8. 东财状态（2026-08-24）：push2（行情快照）已对 Python 解封，
+7. 东财状态（2026-08-24）：push2（行情快照）已对 Python 解封，
    push2his（K线，扫描器依赖）仍按 TLS 指纹封锁，暂不能切回 em。
-7. Git Bash 里调 cmd/schtasks 等 Windows 命令要先 `export MSYS2_ARG_CONV_EXCL='*'`，
+8. Git Bash 里调 cmd/schtasks 等 Windows 命令要先 `export MSYS2_ARG_CONV_EXCL='*'`，
    否则 /c 等参数会被路径转换吃掉。
+9. gm 免费版 quota：日线历史随便拉，但 60 分钟线大批量拉取会报
+   `{"status": 1014, "message": "历史行情服务调用错误"}`，所以 gm 不作扫描主通道。
 
 ## 常用操作
 

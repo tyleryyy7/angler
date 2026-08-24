@@ -25,14 +25,14 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 # ----------------------- 配置区（按需修改） -----------------------
-DATA_SOURCE = "sina"      # 数据源："sina"（新浪）或 "em"（东方财富，原默认；本机被其 WAF 封锁时不可用）
+DATA_SOURCE = "tdx"       # 数据源："tdx"（通达信 xmtdx，默认，快且无限流）/ "sina" / "gm"（须 .venv-gm）/ "em"（本机被封）
 FISHER_LEN = 9            # Fisher 窗口长度，与 Pine/同花顺参数一致
 MIN_BARS = 80             # 60分钟bar少于此数视为暖机不足，跳过（次新股、长期停牌）
 REQUEST_INTERVAL = 0.25   # 每个 worker 每只股票之间的请求间隔（秒），防限流
@@ -61,8 +61,12 @@ logging.basicConfig(
 
 
 def _patch_requests_timeout(default=15):
-    """给 requests（含 akshare 内部调用）补默认超时，防止连接挂起卡死整个扫描。"""
-    import requests
+    """给 requests（含 akshare 内部调用）补默认超时，防止连接挂起卡死整个扫描。
+    未安装 requests 的环境（如精简版 .venv-gm）直接跳过。"""
+    try:
+        import requests
+    except ImportError:
+        return
     _orig = requests.sessions.Session.request
     def _req(self, method, url, **kw):
         kw.setdefault("timeout", default)
@@ -133,22 +137,83 @@ def _sina_symbol(code):
     return ("sh" if code.startswith(("5", "6")) else "sz") + code
 
 
-def fetch_60m(code):
+def _gm_symbol(code):
+    """gm 代码格式：沪 6/5 开头 -> SHSE.xxxxxx，其余 -> SZSE.xxxxxx。"""
+    return ("SHSE." if code.startswith(("5", "6")) else "SZSE.") + code
+
+
+_gm_ready = False
+
+_TDX_BAR_ENDS = ["10:30", "11:30", "14:00", "15:00"]   # 60 分钟 bar 收盘时刻（当日第 1~4 根）
+
+def _fetch_60m_tdx(code):
+    """通达信（xmtdx）60 分钟 K 线（不复权）。
+
+    注意：tdx 盘中第二根 bar（10:30-11:30）会标记为 13:00（跨午休怪癖），
+    因此不采用原始时间戳，按「当日第几根」映射到固定收盘时刻 10:30/11:30/14:00/15:00。
+    """
+    from xmtdx import TdxClient, Market, KlineCategory
+    market = Market.SH if code.startswith(("5", "6")) else Market.SZ
+    with TdxClient.from_best_host(ping_timeout=3.0) as c:
+        bars = c.get_security_bars(market, code, KlineCategory.MIN_60, 0, 200)
+    if not bars:
+        return None
+    df = pd.DataFrame([{"时间": datetime(b.year, b.month, b.day),
+                        "最高": b.high, "最低": b.low, "收盘": b.close} for b in bars])
+    dates = df["时间"].dt.date
+    for d in dates.unique():                       # 按当日序号映射收盘时刻
+        idx = df.index[dates == d]
+        for k, i in enumerate(idx):
+            if k < len(_TDX_BAR_ENDS):
+                hh, mm = _TDX_BAR_ENDS[k].split(":")
+                df.at[i, "时间"] = datetime(d.year, d.month, d.day, int(hh), int(mm))
+    return df
+
+def _fetch_60m_gm(code):
+    """掘金 60 分钟前复权 K 线。注意 gm 的 frequency='3600s' 才是 60 分钟（'60s' 是 1 分钟）。"""
+    global _gm_ready
+    from gm.api import history, ADJUST_PREV, set_token
+    if not _gm_ready:
+        token_file = Path(__file__).resolve().parent / "gm_token.key"
+        set_token(token_file.read_text(encoding="utf-8").strip())
+        _gm_ready = True
+    end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    start = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+    df = history(symbol=_gm_symbol(code), frequency="3600s",
+                 start_time=start, end_time=end, adjust=ADJUST_PREV, df=True)
+    if df is None or len(df) == 0:
+        return None
+    df = df.rename(columns={"eob": "时间", "high": "最高", "low": "最低", "close": "收盘"})
+    df["时间"] = pd.to_datetime(df["时间"]).dt.tz_localize(None)  # 去时区，便于和本地时间比较
+    return df
+
+
+def fetch_60m(code, source=None):
     """拉取单只股票的 60 分钟前复权 K 线，带重试。失败返回 None。
 
-    新浪源注意：qfq 由「分钟线 + 日线前复权因子」合成，每股需 2 次请求，
-    全市场扫描耗时约为东财源的 2 倍；失败率上升时把 REQUEST_INTERVAL 调大到 0.4~0.5。
+    source: "sina"（默认）/ "gm"（掘金，须在 .venv-gm 运行）/ "em"（东财）。
+    新浪源注意：qfq 由「分钟线 + 日线前复权因子」合成，每股需 2 次请求。
     """
-    import akshare as ak
+    source = source or DATA_SOURCE
     for k in range(RETRY):
         try:
-            if DATA_SOURCE == "sina":
+            if source == "gm":
+                df = _fetch_60m_gm(code)
+                if df is not None and len(df) > 0:
+                    return df
+            elif source == "tdx":
+                df = _fetch_60m_tdx(code)
+                if df is not None and len(df) > 0:
+                    return df
+            elif source == "sina":
+                import akshare as ak
                 df = ak.stock_zh_a_minute(symbol=_sina_symbol(code), period="60", adjust="qfq")
                 if df is not None and len(df) > 0:
                     # 统一为东财列名契约：时间/最高/最低/收盘（时间戳同为 bar 结束时刻）
                     return df.rename(columns={"day": "时间", "high": "最高",
                                               "low": "最低", "close": "收盘"})
             else:
+                import akshare as ak
                 df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
                 if df is not None and len(df) > 0:
                     return df
@@ -194,10 +259,10 @@ def load_pool(args):
     return pool
 
 
-def scan_one(row, side="up"):
+def scan_one(row, side="up", source=None):
     """扫描单只股票：命中返回 dict；未命中 None；拉取失败 'FAIL'；bar 不足 'SKIP'。"""
     code, name = str(row["code"]), row["name"]
-    df = fetch_60m(code)
+    df = fetch_60m(code, source)
     time.sleep(REQUEST_INTERVAL)   # 每个 worker 内部的节流
     if df is None:
         return "FAIL"
@@ -219,7 +284,7 @@ def scan_one(row, side="up"):
     return None
 
 
-def scan(pool, save=True, label="", side="up"):
+def scan(pool, save=True, label="", side="up", source=None):
     """并发扫描整个股票池，返回命中「最新完结bar刚上穿/下穿」的股票清单。
 
     用进程池而非线程池：akshare 新浪前复权链路用的 py_mini_racer 是 C 扩展，
@@ -231,7 +296,7 @@ def scan(pool, save=True, label="", side="up"):
     n = len(pool)
     rows = [row for _, row in pool.iterrows()]
     with ProcessPoolExecutor(max_workers=WORKERS) as ex:
-        futures = [ex.submit(scan_one, row, side) for row in rows]
+        futures = [ex.submit(scan_one, row, side, source) for row in rows]
         for fut in as_completed(futures):
             r = fut.result()
             done += 1
@@ -243,11 +308,17 @@ def scan(pool, save=True, label="", side="up"):
                 hits.append(r)
             if done % 50 == 0:
                 logging.info("进度 %d/%d，命中 %d，失败 %d，跳过 %d", done, n, len(hits), fails, skips)
+            if done >= 20 and fails == done:
+                # 前 20 只全失败：数据源整体不可用（如限流），提前终止，剩余取消
+                logging.warning("前 %d 只全部失败，数据源疑似不可用，提前终止本池扫描", done)
+                for f in futures:
+                    f.cancel()
+                break
 
     result = pd.DataFrame(hits)
     if len(result):
         result = result.sort_values("code").reset_index(drop=True)
-    result.attrs["total"] = n
+    result.attrs["total"] = done       # 用实际处理数，配合提前终止时的失败率判定
     result.attrs["fails"] = fails
     elapsed = time.time() - t0
     logging.info("扫描完成：%d 只耗时 %.1f 分钟，命中 %d 只，失败 %d 只，跳过 %d 只",
@@ -372,7 +443,8 @@ def run_loop(args):
             if last_pool_date != now.date():      # 每天刷新一次股票池
                 pool = load_pool(args)
                 last_pool_date = now.date()
-            notify(scan(pool, label=pool_tag(args), side=args.side),
+            notify(scan(pool, label=pool_tag(args), side=args.side,
+                        source=args.source or DATA_SOURCE),
                    pool_label(args), side=args.side)
             time.sleep(61)                        # 跳过当前这一分钟
         time.sleep(5)
@@ -386,10 +458,13 @@ def main():
     parser.add_argument("--limit", type=int, help="只扫描前 N 只（调试）")
     parser.add_argument("--side", choices=["up", "down"], default="up",
                         help="up=上穿（默认，选股），down=下穿（持仓监控）")
+    parser.add_argument("--source", choices=["sina", "gm", "em", "tdx"], default=None,
+                        help="数据源（缺省用配置区 DATA_SOURCE）；gm 须在 .venv-gm 环境运行")
     parser.add_argument("--buy", metavar="CODE", help="登记买入到 holdings.csv 后退出")
     parser.add_argument("--price", type=float, help="买入价（配合 --buy，缺省取最新价）")
     args = parser.parse_args()
 
+    source = args.source or DATA_SOURCE
     if args.buy:
         buy(args.buy, args.price)
         return
@@ -403,7 +478,7 @@ def main():
         if len(pool) == 0:
             logging.info("股票池为空，跳过扫描")
             return
-        notify(scan(pool, label=pool_tag(args), side=args.side),
+        notify(scan(pool, label=pool_tag(args), side=args.side, source=source),
                pool_label(args), side=args.side)
 
 
