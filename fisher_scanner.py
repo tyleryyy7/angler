@@ -247,6 +247,8 @@ def scan(pool, save=True, label="", side="up"):
     result = pd.DataFrame(hits)
     if len(result):
         result = result.sort_values("code").reset_index(drop=True)
+    result.attrs["total"] = n
+    result.attrs["fails"] = fails
     elapsed = time.time() - t0
     logging.info("扫描完成：%d 只耗时 %.1f 分钟，命中 %d 只，失败 %d 只，跳过 %d 只",
                  n, elapsed / 60, len(result), fails, skips)
@@ -299,11 +301,19 @@ def notify(result, pond="鱼塘", side="up"):
     """结果通知：打印到控制台，并推送到企业微信机器人（WECOM_WEBHOOK 留空则跳过）。
 
     下穿（持仓监控）无命中时不推送，避免每个时点刷「0 条」噪音。
+    失败率超过一半时（如数据源限流），推送「数据源异常」而不是可能漏报的「N 条鱼」。
     """
+    total = result.attrs.get("total", 0)
+    fails = result.attrs.get("fails", 0)
     suffix = "下穿" if side == "down" else ""
-    if len(result) == 0:
+    if total and fails > total / 2:
+        print("本次扫描异常：失败 %d/%d，结果不可信" % (fails, total))
+        content = "**%s：数据源异常，本次结果不可信（失败 %d/%d）**" % (pond, fails, total)
+        should_push = True
+    elif len(result) == 0:
         print("本次扫描：无刚%s标的" % ("下穿" if side == "down" else "上穿"))
         content = "**%s：0 条鱼%s**" % (pond, suffix)
+        should_push = PUSH_EMPTY and side == "up"
     else:
         print("本次扫描命中 %d 只：\n%s" % (len(result), result.to_string(index=False)))
         lines = ["**%s：%d 条鱼%s**" % (pond, len(result), suffix)]
@@ -312,7 +322,7 @@ def notify(result, pond="鱼塘", side="up"):
         if len(result) > PUSH_MAX_ROWS:
             lines.append("……共 %d 只，完整清单见 results CSV" % len(result))
         content = "\n".join(lines)
-    should_push = len(result) > 0 or (PUSH_EMPTY and side == "up")
+        should_push = True
     if WECOM_WEBHOOK and should_push:
         try:
             import requests

@@ -61,6 +61,10 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
    .cmd 里一律用 `python.exe`，靠 run_hidden.vbs 隐藏窗口。
 5. **.cmd 文件必须 CRLF 换行**（LF 会导致批处理解析异常）。
 6. 新浪限流：每股请求间隔 ≥ 0.2s；全市场快照（stock_zh_a_spot）每天只调一次。
+   分钟线接口超限会返回 HTTP 456（akshare 表现为 list index out of range），
+   冷却几十分钟自愈。扫描失败率 >50% 时 notify 会推「数据源异常」而非「0 条鱼」。
+8. 东财状态（2026-08-24）：push2（行情快照）已对 Python 解封，
+   push2his（K线，扫描器依赖）仍按 TLS 指纹封锁，暂不能切回 em。
 7. Git Bash 里调 cmd/schtasks 等 Windows 命令要先 `export MSYS2_ARG_CONV_EXCL='*'`，
    否则 /c 等参数会被路径转换吃掉。
 
