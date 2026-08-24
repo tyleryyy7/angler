@@ -104,6 +104,8 @@ def fetch_universe():
     stocks = get_symbols(1010, skip_suspended=True, skip_st=True,
                          exchanges=["SHSE", "SZSE"], df=True)
     stocks = stocks[stocks["symbol"].str.contains(r"^(SHSE\.60|SZSE\.00)")]
+    # gm 的 skip_st 标志不完整（实测 ST龙津/ ST洲际 未被剔除），必须叠加名称过滤
+    stocks = stocks[~stocks["sec_name"].str.contains("ST|退", na=False)]
     logging.info("主板非ST非停牌 %d 只", len(stocks))
 
     cutoff = datetime.now() - timedelta(days=LIST_MIN_DAYS)

@@ -85,6 +85,8 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
    否则 /c 等参数会被路径转换吃掉。
 9. gm 免费版 quota：日线历史随便拉，但 60 分钟线大批量拉取会报
    `{"status": 1014, "message": "历史行情服务调用错误"}`，所以 gm 不作扫描主通道。
+10. gm `get_symbols(skip_st=True)` 的 is_st 标志不完整（实测 ST龙津/ST洲际 漏剔），
+    建池必须叠加名称过滤 `~sec_name.str.contains("ST|退")`。
 
 ## 常用操作
 
