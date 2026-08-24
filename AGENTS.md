@@ -77,6 +77,8 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 6. 新浪限流：每股请求间隔 ≥ 0.2s；全市场快照（stock_zh_a_spot）每天只调一次。
    分钟线接口超限会返回 HTTP 456（akshare 表现为 list index out of range），
    冷却几十分钟自愈。扫描失败率 >50% 时 notify 会推「数据源异常」而非「0 条鱼」。
+   优化：sina 分支不走 akshare 的 qfq 合成（每股 5 次请求），改为分钟线 jsonp 直连
+   + 日线复权因子当日缓存（cache/daily_qfq/，同日因子不变，准确性无损），每股 1 次请求。
 7. 东财状态（2026-08-24）：push2（行情快照）已对 Python 解封，
    push2his（K线，扫描器依赖）仍按 TLS 指纹封锁，暂不能切回 em。
 8. Git Bash 里调 cmd/schtasks 等 Windows 命令要先 `export MSYS2_ARG_CONV_EXCL='*'`，

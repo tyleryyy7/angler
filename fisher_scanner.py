@@ -50,6 +50,10 @@ PUSH_EMPTY = True           # 无命中时是否也推送一条「无信号」
 PUSH_MAX_ROWS = 50          # 单条推送最多列出的只数（超出提示看 CSV）
 RESULT_DIR = Path(__file__).resolve().parent / "results"
 LOG_FILE = Path(__file__).resolve().parent / "scanner.log"
+CACHE_DIR = Path(__file__).resolve().parent / "cache" / "daily_qfq"  # 日线复权因子缓存（当日有效）
+SINA_KLINE_URL = ("https://quotes.sina.cn/cn/api/jsonp_v2.php/x/"
+                  "CN_MarketDataService.getKLineData")
+SINA_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 # -----------------------------------------------------------------
 
 logging.basicConfig(
@@ -188,11 +192,61 @@ def _fetch_60m_gm(code):
     return df
 
 
+def _daily_qfq_factor(code):
+    """新浪日线前复权因子（qfq_close/raw_close，按日期）。
+
+    当日缓存到 cache/daily_qfq/：同一天内因子不变（除权除息开盘前已确定），
+    每天首次扫描拉一次，之后读本地，把新浪请求量降到每股 1 次。
+    """
+    import akshare as ak
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y%m%d")
+    cache = CACHE_DIR / ("%s_%s.csv" % (code, today))
+    if cache.exists():
+        return pd.read_csv(cache, dtype={"date": str})
+    symbol = _sina_symbol(code)
+    raw = ak.stock_zh_a_daily(symbol=symbol, adjust="")
+    qfq = ak.stock_zh_a_daily(symbol=symbol, adjust="qfq")
+    m = qfq[["date", "close"]].merge(raw[["date", "close"]], on="date",
+                                     suffixes=("_q", "_r"))
+    m["factor"] = m["close_q"].astype(float) / m["close_r"].astype(float)
+    out = m[["date", "factor"]]
+    for old in CACHE_DIR.glob("%s_*.csv" % code):   # 清掉该票的旧日期缓存
+        old.unlink()
+    out.to_csv(cache, index=False)
+    return out
+
+
+def _fetch_60m_sina(code):
+    """新浪 60 分钟前复权：分钟线 jsonp（1 次请求）× 本地缓存的日线因子。
+
+    与 akshare stock_zh_a_minute(adjust='qfq') 的计算口径一致（同一交易日逐位相同），
+    但每股只需 1 次 HTTP 请求（akshare 原版要 5 次）。
+    """
+    import json
+    import requests
+    symbol = _sina_symbol(code)
+    r = requests.get(SINA_KLINE_URL,
+                     params={"symbol": symbol, "scale": 60, "ma": "no", "datalen": 1970},
+                     headers=SINA_HEADERS, timeout=15)
+    data = json.loads(r.text[r.text.index("["):r.text.rindex("]") + 1])
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    fac = _daily_qfq_factor(code)
+    dates = df["day"].str.split(" ", expand=True)[0]
+    fmap = dict(zip(fac["date"], fac["factor"]))
+    factor = dates.map(fmap).ffill().fillna(1.0)   # 当日因子缺失时用最近交易日因子
+    for col in ("open", "high", "low", "close"):
+        df[col] = df[col].astype(float) * factor.values
+    return df.rename(columns={"day": "时间", "high": "最高",
+                              "low": "最低", "close": "收盘"})
+
+
 def fetch_60m(code, source=None):
     """拉取单只股票的 60 分钟前复权 K 线，带重试。失败返回 None。
 
-    source: "sina"（默认）/ "gm"（掘金，须在 .venv-gm 运行）/ "em"（东财）。
-    新浪源注意：qfq 由「分钟线 + 日线前复权因子」合成，每股需 2 次请求。
+    source: "tdx"（默认，不复权）/ "sina" / "gm"（须在 .venv-gm 运行）/ "em"（东财）。
     """
     source = source or DATA_SOURCE
     for k in range(RETRY):
@@ -206,12 +260,9 @@ def fetch_60m(code, source=None):
                 if df is not None and len(df) > 0:
                     return df
             elif source == "sina":
-                import akshare as ak
-                df = ak.stock_zh_a_minute(symbol=_sina_symbol(code), period="60", adjust="qfq")
+                df = _fetch_60m_sina(code)
                 if df is not None and len(df) > 0:
-                    # 统一为东财列名契约：时间/最高/最低/收盘（时间戳同为 bar 结束时刻）
-                    return df.rename(columns={"day": "时间", "high": "最高",
-                                              "low": "最低", "close": "收盘"})
+                    return df
             else:
                 import akshare as ak
                 df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")

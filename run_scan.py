@@ -28,6 +28,8 @@ import fisher_scanner as fs
 BASE = Path(__file__).resolve().parent
 GM_PYTHON = BASE / ".venv-gm" / "Scripts" / "python.exe"
 FAIL_RATE_LIMIT = 0.5         # 失败率超过此值判定通道失效
+CHANNELS = ("tdx",)           # 进程内通道降级链；gm 始终作为最后兜底（子进程）
+                              # 新浪限流修养期：("tdx",)；恢复后改回 ("tdx", "sina")
 POOLS = [("pool_right.csv", "up"), ("pool_left.csv", "up"), ("pool_deep.csv", "up"),
          ("pool_t0.csv", "up"), ("pool_t1.csv", "up"), ("holdings.csv", "down")]
 
@@ -64,7 +66,7 @@ def push_alert(text):
 
 def scan_with_failover(pool, pool_file, pond, tag, side):
     """降级链：tdx（通达信，进程内）→ sina（进程内）→ gm（.venv-gm 子进程）。"""
-    for source in ("tdx", "sina"):
+    for source in CHANNELS:
         result = fs.scan(pool, label=tag, side=side, source=source)
         total = result.attrs.get("total", 0)
         fails = result.attrs.get("fails", 0)
