@@ -39,7 +39,8 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 
 - 右侧池 pool_right.csv：MACD DIF 连升两日 且 DIF > DEA 且 **DIF > 0**（零轴闸门是后加的，勿去掉）
 - 左侧池 pool_left.csv：DIF 连升两日 且 DIF < DEA 且 **DIF < 0**
-- 深水池 pool_deep.csv：无 MACD，日线 Fisher(9) < -2（实验性）
+- 深水池 pool_deep.csv：无 MACD，日线 Fisher(9) < -2（实验性）；池内按五维打分降序
+  （score_deep：下跌减速30%/位置支撑25%/资金CMF20%/周线共振15%/极端度10%）
 - T0/T1 ETF 池：ETF 统一走深水方案（日线 Fisher < -2），按 trade_n 拆分；不走 MACD
 - 持仓：60 分钟 Fisher 下穿预警，无命中不推送
 

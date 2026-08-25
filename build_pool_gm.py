@@ -16,7 +16,8 @@ token 获取：掘金终端 -> 量化交易 -> token 管理。
           20 日均成交额 >= AVG_AMOUNT_MIN、20 日均振幅 >= AVG_AMPLITUDE_MIN
     右侧：MACD DIF 连升两日 且 DIF > DEA 且 DIF > 0（零上趋势已成）
     左侧：MACD DIF 连升两日 且 DIF < DEA 且 DIF < 0（零下拐点埋伏）
-    深水：无 MACD 闸门，日线 Fisher(9) < FISHER_DEEP_MAX
+    深水：无 MACD 闸门，日线 Fisher(9) < FISHER_DEEP_MAX；池内按五维打分降序
+          （score_deep：下跌减速/位置支撑/资金CMF/周线共振/极端度归一化）
     T+0/T+1 ETF 池（pool_t0.csv / pool_t1.csv）：剔联接/货币、上市满 120 天、
           20 日均成交额 >= ETF_AVG_AMOUNT_MIN、20 日均振幅 >= ETF_AVG_AMPLITUDE_MIN，
           统一走深水方案：日线 Fisher < FISHER_DEEP_MAX，不走 MACD 左右侧
@@ -37,7 +38,7 @@ MIN_PRICE = 2.0               # 剔股价低于此值（元）
 AVG_AMOUNT_MIN = 2e8          # 20 日均成交额下限（元）
 AVG_AMPLITUDE_MIN = 2.5       # 20 日均振幅下限（%）
 NEED_DAYS = 20                # 均值窗口（交易日）
-HIST_DAYS = 240               # 拉取自然日数（约 160 根日 bar，够 MACD 暖机 + 统计窗口）
+HIST_DAYS = 500               # 拉取自然日数（约 345 根日 bar：支撑分析 + 周线暖机需要）
 LIST_MIN_DAYS = 365           # 上市满 1 年
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 FISHER_LEN = 9
@@ -148,8 +149,7 @@ def fetch_daily(symbol):
     for k in range(RETRY):
         try:
             df = history(symbol=symbol, frequency="1d", start_time=start, end_time=end,
-                         fields="open,high,low,close,volume,amount",
-                         adjust=ADJUST_PREV, df=True)
+                         adjust=ADJUST_PREV, df=True)   # 不带 fields，保留 eob 日期列（周线重采样用）
             if df is not None and len(df) > 0:
                 return df
         except Exception as e:
@@ -190,6 +190,87 @@ def classify(df):
         elif d1 < dea1 and d1 < 0:      # 左侧：零下，DIF 拐头向 DEA 靠近
             side = "left"
     return avg_amount, avg_amp, float(d1), float(dea1), side, fisher_daily
+
+
+def score_deep(df):
+    """深水池五维打分（每项 -2~+2，加权总分 -2~+2）。
+
+    A 下跌减速(30%)：绿柱连缩 +1 / DIF 拐头 +1 / Fisher 底背离 +1，封顶 +2
+    B 位置支撑(25%)：距 240 日前低 ≤3% → +2，≤8% → +1；破位（低于前低）→ -2
+    C 资金 CMF(20)：连续 3 日改善 +1（且 >0 则 +2）；连续 3 日恶化 -1；创 20 日新低 -2
+    D 周线共振(15%)：周线 Fisher < -2 → +2；周线 Fisher >1 且拐头向下 → -2
+    E 极端度(10%)：当前 Fisher 在自身历史分布 <5% 分位 → +2；<15% → +1
+    """
+    close = df["close"].astype(float).reset_index(drop=True)
+    high = df["high"].astype(float).reset_index(drop=True)
+    low = df["low"].astype(float).reset_index(drop=True)
+    vol = pd.to_numeric(df["volume"], errors="coerce").reset_index(drop=True)
+    fish = fisher_transform(high.values, low.values, FISHER_LEN)
+    dif, dea = macd(close)
+    hist = dif - dea
+
+    # A. 下跌减速
+    a = 0
+    if hist.iloc[-1] > hist.iloc[-2] > hist.iloc[-3] and hist.iloc[-1] < 0:
+        a += 1                                          # 绿柱连续收缩
+    if dif.iloc[-1] > dif.iloc[-2]:
+        a += 1                                          # DIF 拐头
+    if close.iloc[-1] <= close.iloc[-20:].min() and fish[-1] > fish[-20:].min():
+        a += 1                                          # Fisher 底背离
+    a = min(a, 2)
+
+    # B. 位置支撑（简化版：距 240 日前低的距离，破位即悬空）
+    b = 0
+    lo = low.iloc[max(0, len(low) - 260):-20]
+    if len(lo) > 0:
+        prior_low = lo.min()
+        c = close.iloc[-1]
+        if c < prior_low:
+            b = -2                                      # 破位悬空
+        else:
+            dist = (c - prior_low) / prior_low
+            if dist <= 0.03:
+                b = 2
+            elif dist <= 0.08:
+                b = 1
+
+    # C. 资金 CMF(20)
+    clv = (((close - low) - (high - close)) / (high - low).replace(0, np.nan)).fillna(0)
+    cmf = (clv * vol).rolling(NEED_DAYS).sum() / vol.rolling(NEED_DAYS).sum()
+    cmf = cmf.dropna()
+    cc = 0
+    if len(cmf) >= 21:
+        if cmf.iloc[-1] > cmf.iloc[-2] > cmf.iloc[-3]:
+            cc = 2 if cmf.iloc[-1] > 0 else 1
+        elif cmf.iloc[-1] < cmf.iloc[-2] < cmf.iloc[-3]:
+            cc = -1
+        if cmf.iloc[-1] < cmf.iloc[-21:-1].min():
+            cc = -2                                     # CMF 创 20 日新低
+
+    # D. 周线共振（日 K 重采样为周 K，含未完结的本周，周一最糙周四五最准）
+    d = 0
+    if "eob" in df.columns:
+        wk = df.copy()
+        wk["dt"] = pd.to_datetime(wk["eob"]).dt.tz_localize(None)
+        wk = wk.set_index("dt").resample("W-FRI").agg(
+            {"high": "max", "low": "min"}).dropna()
+        if len(wk) >= 25:
+            wfish = fisher_transform(wk["high"].values, wk["low"].values, FISHER_LEN)
+            if wfish[-1] < FISHER_DEEP_MAX:
+                d = 2
+            elif wfish[-1] > 1 and wfish[-1] < wfish[-2]:
+                d = -2
+
+    # E. 极端度归一化（自身历史分位，防高波动票霸榜）
+    e = 0
+    pct = float((fish < fish[-1]).mean())
+    if pct < 0.05:
+        e = 2
+    elif pct < 0.15:
+        e = 1
+
+    total = 0.30 * a + 0.25 * b + 0.20 * cc + 0.15 * d + 0.10 * e
+    return {"score": round(total, 2), "sA": a, "sB": b, "sC": cc, "sD": d, "sE": e}
 
 
 def fetch_etf_universe():
@@ -264,7 +345,10 @@ def build_etf_pools():
 def save_results(right, left, deep):
     pd.DataFrame(right).to_csv(OUT_RIGHT, index=False, encoding="utf-8-sig")
     pd.DataFrame(left).to_csv(OUT_LEFT, index=False, encoding="utf-8-sig")
-    pd.DataFrame(deep).to_csv(OUT_DEEP, index=False, encoding="utf-8-sig")
+    ddf = pd.DataFrame(deep)
+    if len(ddf) and "score" in ddf.columns:
+        ddf = ddf.sort_values("score", ascending=False)   # 深水池按打分降序
+    ddf.to_csv(OUT_DEEP, index=False, encoding="utf-8-sig")
 
 
 def main():
@@ -320,6 +404,7 @@ def main():
                     elif r[4] == "left":
                         left.append(rec)
                     if r[5] < FISHER_DEEP_MAX:
+                        rec.update(score_deep(df))   # 深水池就地打分（复用日线 df，零额外请求）
                         deep.append(rec)
             prog.write(code + "\n")
             prog.flush()
