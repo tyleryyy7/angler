@@ -110,19 +110,25 @@ pip install -r requirements.txt
 
 注意：日线 Fisher 以凌晨建池时的上一交易日收盘为准，盘中固定不变。
 
-### 持仓监控（下穿预警）
+### 持仓监控（下穿预警 + 上穿回钩）与观察池
 
 买入后登记到 `holdings.csv`（或直接告诉我帮你登记）：
 
 ```bash
-.venvScriptspython.exe fisher_scanner.py --buy 600036 --price 38.86   # --price 可省，缺省取最新价
+.venv\Scripts\python.exe fisher_scanner.py --buy 600036 --price 38.86   # --price 可省，缺省取最新价
 ```
 
-盘中持仓随 4 个时点任务自动监控 60 分钟**下穿**（由升转跌拐点），命中推送
-「持仓鱼塘：N 条鱼下穿」；无命中不推送（避免噪音）。手动触发：
+- **持仓双向监控**：每个时点扫下穿（卖出预警「持仓鱼塘：N 条鱼下穿」）+ 上穿（回钩/加仓提示
+  「持仓鱼塘：N 条鱼回钩」）。部分减仓不用动文件。
+- **清仓**：`--sell CODE` 一条命令把股票移出持仓并加入观察池 `watchlist.csv`，
+  继续盯 60 分钟上穿，命中推送「观察鱼塘：N 条鱼回钩」——日线逻辑还在的票不会跟丢。
+- **观察池**：也可直接 `--watch CODE` 手动加入任意股票；`--buy` 买回时自动移出观察池。
+- 持仓/观察池无命中不推送（避免噪音）；卖出后不想盯了就删掉 watchlist.csv 对应行。
+
+手动触发持仓下穿扫描：
 
 ```bash
-.venvScriptspython.exe fisher_scanner.py --once --pool-file holdings.csv --side down
+.venv\Scripts\python.exe fisher_scanner.py --once --pool-file holdings.csv --side down
 ```
 
 卖出后编辑 `holdings.csv` 删掉对应行即可。
@@ -133,7 +139,7 @@ pip install -r requirements.txt
 pip install -r requirements.txt
 
 # 先小规模测试（只扫前 50 只，验证环境）
-.venvScriptspython.exe fisher_scanner.py --once --limit 50
+.venv\Scripts\python.exe fisher_scanner.py --once --limit 50
 ```
 
 ## 正式运行（两种方式选一）
@@ -173,7 +179,7 @@ schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hid
 ### 方式 B：常驻模式
 
 ```bash
-.venvScriptspython.exe fisher_scanner.py --loop
+.venv\Scripts\python.exe fisher_scanner.py --loop
 ```
 
 进程常驻，工作日 10:31 / 11:31 / 14:01 / 15:01 自动扫描（注意：此模式只按星期判断，

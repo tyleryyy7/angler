@@ -31,7 +31,10 @@ FAIL_RATE_LIMIT = 0.5         # 失败率超过此值判定通道失效
 CHANNELS = ("tdx",)           # 进程内通道降级链；gm 始终作为最后兜底（子进程）
                               # 新浪限流修养期：("tdx",)；恢复后改回 ("tdx", "sina")
 POOLS = [("pool_right.csv", "up"), ("pool_left.csv", "up"), ("pool_deep.csv", "up"),
-         ("pool_t0.csv", "up"), ("pool_t1.csv", "up"), ("holdings.csv", "down")]
+         ("pool_t0.csv", "up"), ("pool_t1.csv", "up"),
+         ("watchlist.csv", "up"),          # 观察池：盯 60 分钟上穿回钩
+         ("holdings.csv", "up"),           # 持仓上穿：回钩/加仓提示
+         ("holdings.csv", "down")]         # 持仓下穿：卖出预警
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s",

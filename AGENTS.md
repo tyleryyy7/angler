@@ -20,6 +20,8 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 - `build_pool.cmd` — 建池任务入口（CRLF）。
 - `run_hidden.vbs` — 隐藏控制台启动器，所有计划任务经它调用 .cmd（防弹窗）。
 - `holdings.csv` — 用户持仓（code,name,buy_date,buy_price），gitignore。
+- `watchlist.csv` — 观察池（清仓/放过但继续盯上穿回钩的票），gitignore。
+  --buy 登记持仓、--sell 清仓入观察池、--watch 手动加观察池；持仓双向监控（上穿回钩+下穿预警）。
 - `webhook.key` / `gm_token.key` — 密钥文件，gitignore，**绝不提交**。
 - `results/`、`scanner.log`、`dual_progress.txt`、`gm_progress.txt` — 运行产物，gitignore。
 

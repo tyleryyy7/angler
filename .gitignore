@@ -10,6 +10,7 @@ gm_token.key
 
 # 个人持仓
 holdings.csv
+watchlist.csv
 
 # 生成的数据与日志
 pool*.csv

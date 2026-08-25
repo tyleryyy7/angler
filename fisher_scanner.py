@@ -388,6 +388,8 @@ def pool_label(args):
     f = (args.pool_file or "").lower()
     if "holding" in f:
         return "持仓鱼塘"
+    if "watch" in f:
+        return "观察鱼塘"
     if "right" in f:
         return "右侧鱼塘"
     if "left" in f:
@@ -406,6 +408,8 @@ def pool_tag(args):
     f = (args.pool_file or "").lower()
     if "holding" in f:
         return "holdings"
+    if "watch" in f:
+        return "watch"
     if "right" in f:
         return "right"
     if "left" in f:
@@ -422,12 +426,18 @@ def pool_tag(args):
 def notify(result, pond="鱼塘", side="up"):
     """结果通知：打印到控制台，并推送到企业微信机器人（WECOM_WEBHOOK 留空则跳过）。
 
-    下穿（持仓监控）无命中时不推送，避免每个时点刷「0 条」噪音。
+    静默规则：下穿（持仓监控）与观察池/持仓上穿（回钩）无命中时不推送，避免噪音；
+    池类（右侧/左侧/深水/T0/T1）受 PUSH_EMPTY 控制。
     失败率超过一半时（如数据源限流），推送「数据源异常」而不是可能漏报的「N 条鱼」。
     """
     total = result.attrs.get("total", 0)
     fails = result.attrs.get("fails", 0)
-    suffix = "下穿" if side == "down" else ""
+    if side == "down":
+        suffix = "下穿"
+    elif pond in ("持仓鱼塘", "观察鱼塘"):
+        suffix = "回钩"
+    else:
+        suffix = ""
     if total and fails > total / 2:
         print("本次扫描异常：失败 %d/%d，结果不可信" % (fails, total))
         content = "**%s：数据源异常，本次结果不可信（失败 %d/%d）**" % (pond, fails, total)
@@ -435,7 +445,8 @@ def notify(result, pond="鱼塘", side="up"):
     elif len(result) == 0:
         print("本次扫描：无刚%s标的" % ("下穿" if side == "down" else "上穿"))
         content = "**%s：0 条鱼%s**" % (pond, suffix)
-        should_push = PUSH_EMPTY and side == "up"
+        should_push = (PUSH_EMPTY and side == "up"
+                       and pond not in ("持仓鱼塘", "观察鱼塘"))
     else:
         print("本次扫描命中 %d 只：\n%s" % (len(result), result.to_string(index=False)))
         lines = ["**%s：%d 条鱼%s**" % (pond, len(result), suffix)]
@@ -457,30 +468,80 @@ def notify(result, pond="鱼塘", side="up"):
             logging.warning("企业微信推送失败: %s", e)
 
 
-def buy(code, price=None):
-    """把股票登记进 holdings.csv（持仓监控清单）；已在清单中则跳过。"""
-    path = Path(__file__).resolve().parent / "holdings.csv"
+def _load_list(filename):
+    """读持仓/观察清单 CSV；不存在则返回带表头的空表。"""
+    path = Path(__file__).resolve().parent / filename
     if path.exists():
-        h = pd.read_csv(path, dtype={"code": str})
-    else:
-        h = pd.DataFrame(columns=["code", "name", "buy_date", "buy_price"])
-    code = str(code).zfill(6)
-    if code in h["code"].astype(str).values:
-        logging.info("%s 已在持仓清单中", code)
-        return
+        return pd.read_csv(path, dtype={"code": str})
+    return pd.DataFrame(columns=["code", "name", "buy_date", "buy_price"])
+
+
+def _save_list(filename, df):
+    df.to_csv(Path(__file__).resolve().parent / filename, index=False, encoding="utf-8-sig")
+
+
+def _lookup_name_price(code):
+    """用新浪全市场快照查名称和最新价（约 20 秒，低频操作可接受）。"""
     import akshare as ak
     spot = ak.stock_zh_a_spot()
     row = spot[spot["代码"].str[2:] == code]
     name = row["名称"].iloc[0] if len(row) else ""
-    if price is None and len(row):
-        price = float(row["最新价"].iloc[0])
+    price = float(row["最新价"].iloc[0]) if len(row) else None
+    return name, price
+
+
+def buy(code, price=None):
+    """把股票登记进 holdings.csv（持仓监控清单）；已在清单中则跳过。
+    若该票在观察池中则自动移出（买回了就不用盯回钩了）。"""
+    h = _load_list("holdings.csv")
+    code = str(code).zfill(6)
+    if code in h["code"].astype(str).values:
+        logging.info("%s 已在持仓清单中", code)
+        return
+    name, spot_price = _lookup_name_price(code)
+    if price is None:
+        price = spot_price
     h = pd.concat([h, pd.DataFrame([{
         "code": code, "name": name,
         "buy_date": datetime.now().strftime("%Y-%m-%d"),
         "buy_price": price if price else "",
     }])], ignore_index=True)
-    h.to_csv(path, index=False, encoding="utf-8-sig")
+    _save_list("holdings.csv", h)
+    w = _load_list("watchlist.csv")
+    if code in w["code"].astype(str).values:
+        _save_list("watchlist.csv", w[w["code"] != code].reset_index(drop=True))
+        print("已从观察池移出")
     print("已登记持仓: %s %s 买入价 %s" % (code, name, price))
+
+
+def watch(code):
+    """把股票加入 watchlist.csv（观察池，监控 60 分钟上穿回钩）。"""
+    w = _load_list("watchlist.csv")
+    code = str(code).zfill(6)
+    if code in w["code"].astype(str).values:
+        logging.info("%s 已在观察池中", code)
+        return
+    name, price = _lookup_name_price(code)
+    w = pd.concat([w, pd.DataFrame([{
+        "code": code, "name": name,
+        "buy_date": datetime.now().strftime("%Y-%m-%d"),
+        "buy_price": price if price else "",
+    }])], ignore_index=True)
+    _save_list("watchlist.csv", w)
+    print("已加入观察池: %s %s" % (code, name))
+
+
+def sell(code):
+    """清仓：从 holdings.csv 移除并加入 watchlist.csv（继续盯 60 分钟上穿回钩）。"""
+    code = str(code).zfill(6)
+    h = _load_list("holdings.csv")
+    row = h[h["code"] == code]
+    if len(row) == 0:
+        print("%s 不在持仓清单中" % code)
+    else:
+        _save_list("holdings.csv", h[h["code"] != code].reset_index(drop=True))
+        print("已从持仓移除: %s %s" % (code, row["name"].iloc[0]))
+        watch(code)
 
 
 def run_loop(args):
@@ -513,11 +574,19 @@ def main():
                         help="数据源（缺省用配置区 DATA_SOURCE）；gm 须在 .venv-gm 环境运行")
     parser.add_argument("--buy", metavar="CODE", help="登记买入到 holdings.csv 后退出")
     parser.add_argument("--price", type=float, help="买入价（配合 --buy，缺省取最新价）")
+    parser.add_argument("--sell", metavar="CODE", help="清仓：移出持仓并加入观察池后退出")
+    parser.add_argument("--watch", metavar="CODE", help="加入观察池（盯 60 分钟上穿回钩）后退出")
     args = parser.parse_args()
 
     source = args.source or DATA_SOURCE
     if args.buy:
         buy(args.buy, args.price)
+        return
+    if args.sell:
+        sell(args.sell)
+        return
+    if args.watch:
+        watch(args.watch)
         return
     if args.loop:
         run_loop(args)
