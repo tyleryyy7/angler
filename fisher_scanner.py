@@ -368,7 +368,11 @@ def scan(pool, save=True, label="", side="up", source=None):
 
     result = pd.DataFrame(hits)
     if len(result):
-        result = result.sort_values("code").reset_index(drop=True)
+        if "score" in pool.columns:   # 带打分的池（如深水池）：附分数并按分数降序
+            result = result.merge(pool[["code", "score"]], on="code", how="left")
+            result = result.sort_values("score", ascending=False).reset_index(drop=True)
+        else:
+            result = result.sort_values("code").reset_index(drop=True)
     result.attrs["total"] = done       # 用实际处理数，配合提前终止时的失败率判定
     result.attrs["fails"] = fails
     elapsed = time.time() - t0
@@ -450,8 +454,12 @@ def notify(result, pond="鱼塘", side="up"):
     else:
         print("本次扫描命中 %d 只：\n%s" % (len(result), result.to_string(index=False)))
         lines = ["**%s：%d 条鱼%s**" % (pond, len(result), suffix)]
-        lines += ["%s %s" % (r["code"], r["name"])
-                  for _, r in result.head(PUSH_MAX_ROWS).iterrows()]
+        if "score" in result.columns:   # 带打分的池附分数
+            lines += ["%s %s（%s）" % (r["code"], r["name"], r["score"])
+                      for _, r in result.head(PUSH_MAX_ROWS).iterrows()]
+        else:
+            lines += ["%s %s" % (r["code"], r["name"])
+                      for _, r in result.head(PUSH_MAX_ROWS).iterrows()]
         if len(result) > PUSH_MAX_ROWS:
             lines.append("……共 %d 只，完整清单见 results CSV" % len(result))
         content = "\n".join(lines)
