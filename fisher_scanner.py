@@ -6,10 +6,11 @@ Fisher Transform 60分钟线「刚上穿」扫描器（沪深A股，akshare；�
 信号定义（与你的 Pine / 同花顺代码完全一致）：
     fish2 = fish1[1]，所以「上穿」= fish1 由跌转升的拐点：
     fish[t] > fish[t-1] 且 fish[t-1] <= fish[t-2]
-    每次扫描只判断【最新已完结】的那根 60 分钟 bar。
+    默认只判断【最新已完结】的那根 60 分钟 bar；加 --live 则盘中未完结 bar 也参与判定。
 
 A股 60 分钟 bar 一天 4 根，东财时间戳为 bar 结束时刻：10:30 / 11:30 / 14:00 / 15:00。
-建议在每根 bar 收盘后 1 分钟运行：10:31 / 11:31 / 14:01 / 15:01。
+完结信号建议在每根 bar 收盘后 1 分钟运行：10:31 / 11:31 / 14:01 / 15:01；
+盘中（--live）信号在 bar 中段运行（10:16 / 11:16 / 13:46 / 14:46），持仓每 15 分钟。
 
 用法：
     python fisher_scanner.py --once                      # 扫一次退出（配合 cron / 任务计划）
@@ -51,6 +52,7 @@ PUSH_MAX_ROWS = 50          # 单条推送最多列出的只数（超出提示�
 RESULT_DIR = Path(__file__).resolve().parent / "results"
 LOG_FILE = Path(__file__).resolve().parent / "scanner.log"
 CACHE_DIR = Path(__file__).resolve().parent / "cache" / "daily_qfq"  # 日线复权因子缓存（当日有效）
+PUSHED_FILE = Path(__file__).resolve().parent / "cache" / "pushed_signals.json"  # 当日已推送信号去重记录
 SINA_KLINE_URL = ("https://quotes.sina.cn/cn/api/jsonp_v2.php/x/"
                   "CN_MarketDataService.getKLineData")
 SINA_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -121,18 +123,19 @@ def just_crossed_down(fish, trigger, j):
     return fish[j] < trigger[j] and fish[j - 1] >= trigger[j - 1]
 
 
-def signal_bar_index(df, now=None):
+def signal_bar_index(df, now=None, live=False):
     """返回用于判定信号的 bar 下标。
 
     东财 60 分钟 bar 时间戳 = bar 结束时刻（10:30/11:30/14:00/15:00）。
-    盘中最后一根可能正在形成（now 早于其结束时刻），此时丢弃它、用 -2；
-    否则最后一根已完结，用 -1。
+    盘中最后一根可能正在形成（now 早于其结束时刻）：
+    live=False（默认）丢弃它、用 -2；live=True（盘中信号）直接用它、用 -1。
+    注意 live 信号基于未完结 bar，收盘前可能消失或翻转。
     """
     if now is None:
         now = datetime.now()
     last_ts = pd.to_datetime(df["时间"].iloc[-1])
     if last_ts.date() == now.date() and now < last_ts:
-        return -2
+        return -1 if live else -2
     return -1
 
 
@@ -188,7 +191,7 @@ def _fetch_60m_gm(code):
     if df is None or len(df) == 0:
         return None
     df = df.rename(columns={"eob": "时间", "high": "最高", "low": "最低", "close": "收盘"})
-    df["时间"] = pd.to_datetime(df["时间"]).dt.tz_localize(None)  # 去时区，便于和本地时间比较
+    df["时间"] = pd.to_datetime(df["时间"]).dt.tz_localize(None)  # 去时区 11，便于和本地时间比较
     return df
 
 
@@ -310,7 +313,7 @@ def load_pool(args):
     return pool
 
 
-def scan_one(row, side="up", source=None):
+def scan_one(row, side="up", source=None, live=False):
     """扫描单只股票：命中返回 dict；未命中 None；拉取失败 'FAIL'；bar 不足 'SKIP'。"""
     code, name = str(row["code"]), row["name"]
     df = fetch_60m(code, source)
@@ -322,22 +325,27 @@ def scan_one(row, side="up", source=None):
     high = pd.to_numeric(df["最高"], errors="coerce").values
     low = pd.to_numeric(df["最低"], errors="coerce").values
     fish, trig = fisher_transform(high, low, FISHER_LEN)
-    j = len(df) + signal_bar_index(df)
+    now = datetime.now()
+    j = len(df) + signal_bar_index(df, now=now, live=live)
     crossed = just_crossed_down(fish, trig, j) if side == "down" else just_crossed_up(fish, trig, j)
     if crossed:
+        bar_ts = pd.to_datetime(df["时间"].iloc[j])
         return {
             "code": code, "name": name,
             "bar_time": str(df["时间"].iloc[j]),
             "close": float(pd.to_numeric(df["收盘"], errors="coerce").iloc[j]),
             "fisher": round(float(fish[j]), 3),
             "trigger": round(float(trig[j]), 3),
+            # 当日且尚未到 bar 结束时刻 → 未完结（盘中信号）
+            "bar_state": "未完结" if bar_ts.date() == now.date() and now < bar_ts else "完结",
         }
     return None
 
 
-def scan(pool, save=True, label="", side="up", source=None):
-    """并发扫描整个股票池，返回命中「最新完结bar刚上穿/下穿」的股票清单。
+def scan(pool, save=True, label="", side="up", source=None, live=False):
+    """并发扫描整个股票池，返回命中「刚上穿/下穿」的股票清单。
 
+    live=False 只判最新完结 bar；live=True 盘中未完结 bar 也参与判定。
     用进程池而非线程池：akshare 新浪前复权链路用的 py_mini_racer 是 C 扩展，
     多线程下会崩解释器；多进程各自独立则无此问题。
     """
@@ -347,7 +355,7 @@ def scan(pool, save=True, label="", side="up", source=None):
     n = len(pool)
     rows = [row for _, row in pool.iterrows()]
     with ProcessPoolExecutor(max_workers=WORKERS) as ex:
-        futures = [ex.submit(scan_one, row, side, source) for row in rows]
+        futures = [ex.submit(scan_one, row, side, source, live) for row in rows]
         for fut in as_completed(futures):
             r = fut.result()
             done += 1
@@ -427,12 +435,31 @@ def pool_tag(args):
     return ""
 
 
+def _load_pushed():
+    """读当日已推送信号键集合（去重用）；文件缺失/损坏返回空集合。"""
+    import json
+    try:
+        keys = json.loads(PUSHED_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    today = datetime.now().strftime("%Y-%m-%d")
+    return set(k for k in keys if k.startswith(today + "|"))
+
+
+def _save_pushed(keys):
+    """写回已推送信号键（只保留当日条目）。"""
+    import json
+    PUSHED_FILE.parent.mkdir(exist_ok=True)
+    PUSHED_FILE.write_text(json.dumps(sorted(keys), ensure_ascii=False), encoding="utf-8")
+
+
 def notify(result, pond="鱼塘", side="up"):
     """结果通知：打印到控制台，并推送到企业微信机器人（WECOM_WEBHOOK 留空则跳过）。
 
     静默规则：下穿（持仓监控）与观察池/持仓上穿（回钩）无命中时不推送，避免噪音；
     池类（右侧/左侧/深水/T0/T1）受 PUSH_EMPTY 控制。
     失败率超过一半时（如数据源限流），推送「数据源异常」而不是可能漏报的「N 条鱼」。
+    同一根 bar 的同一信号当日只推一次（盘中未完结信号推过后，收盘完结确认不重复推送）。
     """
     total = result.attrs.get("total", 0)
     fails = result.attrs.get("fails", 0)
@@ -452,18 +479,37 @@ def notify(result, pond="鱼塘", side="up"):
         should_push = (PUSH_EMPTY and side == "up"
                        and pond not in ("持仓鱼塘", "观察鱼塘"))
     else:
-        print("本次扫描命中 %d 只：\n%s" % (len(result), result.to_string(index=False)))
-        lines = ["**%s：%d 条鱼%s**" % (pond, len(result), suffix)]
-        if "score" in result.columns:   # 带打分的池附分数
-            lines += ["%s %s（%s）" % (r["code"], r["name"], r["score"])
-                      for _, r in result.head(PUSH_MAX_ROWS).iterrows()]
-        else:
-            lines += ["%s %s" % (r["code"], r["name"])
-                      for _, r in result.head(PUSH_MAX_ROWS).iterrows()]
+        # 去重：同一根 bar 的同一信号当日只推一次
+        pushed = _load_pushed()
+        today = datetime.now().strftime("%Y-%m-%d")
+        keys = ["%s|%s|%s|%s|%s" % (today, pond, side, r["code"], r["bar_time"])
+                for _, r in result.iterrows()]
+        keep = [i for i, k in enumerate(keys) if k not in pushed]
+        if len(keep) < len(keys):
+            logging.info("%s：%d 只命中已推送过，去重后剩 %d 只",
+                         pond, len(result) - len(keep), len(keep))
+        print("本次扫描命中 %d 只（去重后 %d 只）：\n%s"
+              % (len(result), len(keep), result.to_string(index=False)))
+        if not keep:
+            return
+        result = result.iloc[keep].reset_index(drop=True)
+        keys = [keys[i] for i in keep]
+        has_live = "bar_state" in result.columns and (result["bar_state"] == "未完结").any()
+        title = "**%s：%d 条鱼%s%s**" % (pond, len(result), suffix,
+                                        "（含盘中信号，bar 未完结）" if has_live else "")
+
+        def _row_text(r):
+            tag = "（未完结）" if r.get("bar_state") == "未完结" else ""
+            if "score" in result.columns:   # 带打分的池附分数
+                return "%s %s（%s）%s" % (r["code"], r["name"], r["score"], tag)
+            return "%s %s%s" % (r["code"], r["name"], tag)
+
+        lines = [title] + [_row_text(r) for _, r in result.head(PUSH_MAX_ROWS).iterrows()]
         if len(result) > PUSH_MAX_ROWS:
             lines.append("……共 %d 只，完整清单见 results CSV" % len(result))
         content = "\n".join(lines)
         should_push = True
+        _save_pushed(pushed | set(keys))
     if WECOM_WEBHOOK and should_push:
         try:
             import requests
@@ -584,6 +630,8 @@ def main():
     parser.add_argument("--price", type=float, help="买入价（配合 --buy，缺省取最新价）")
     parser.add_argument("--sell", metavar="CODE", help="清仓：移出持仓并加入观察池后退出")
     parser.add_argument("--watch", metavar="CODE", help="加入观察池（盯 60 分钟上穿回钩）后退出")
+    parser.add_argument("--live", action="store_true",
+                        help="盘中信号：未完结的 60 分钟 bar 也参与判定（可能收盘前消失/翻转）")
     args = parser.parse_args()
 
     source = args.source or DATA_SOURCE
@@ -606,7 +654,7 @@ def main():
         if len(pool) == 0:
             logging.info("股票池为空，跳过扫描")
             return
-        notify(scan(pool, label=pool_tag(args), side=args.side, source=source),
+        notify(scan(pool, label=pool_tag(args), side=args.side, source=source, live=args.live),
                pool_label(args), side=args.side)
 
 

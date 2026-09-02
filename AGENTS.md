@@ -2,9 +2,10 @@
 
 ## 项目是什么
 
-沪深 A 股/ETF 量化扫描系统：夜间建股票池，盘中每个 60 分钟 bar 收盘后扫描
-Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出预警），
-结果推送到企业微信机器人（用户在微信接收）。全流程由 Windows 计划任务驱动。
+沪深 A 股/ETF 量化扫描系统：夜间建股票池，盘中扫描 60 分钟 Fisher Transform
+上穿信号（买入），持仓股监控下穿信号（卖出预警），结果推送到企业微信机器人
+（用户在微信接收）。信号分两类：完结确认（bar 收盘后）和盘中信号（bar 未完结，
+`--live` 判定，可能收盘前消失/翻转，推送有标注）。全流程由 Windows 计划任务驱动。
 
 ## 文件结构
 
@@ -16,7 +17,9 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 - `build_pool_dual.py` — 建池（新浪版，**备用**，主环境 `.venv` 运行）。
   gm 不可用时切回，输出文件名相同。
 - `build_pool.py` — 已删除（旧单池方案，git 历史可查）。
-- `scan_all.cmd` — 盘中扫描入口：调用 run_scan.py（CRLF 换行，勿改 LF）。
+- `scan_all.cmd` — 盘中扫描入口（收盘完结确认，无参数，CRLF 换行，勿改 LF）。
+- `scan_mid.cmd` — bar 中段扫描入口：`run_scan.py --live`（未完结 bar 也判定，CRLF）。
+- `scan_holdings.cmd` — 持仓每 15 分钟监控入口：`run_scan.py --holdings --live`（CRLF）。
 - `build_pool.cmd` — 建池任务入口（CRLF）。
 - `run_hidden.vbs` — 隐藏控制台启动器，所有计划任务经它调用 .cmd（防弹窗）。
 - `holdings.csv` — 用户持仓（code,name,buy_date,buy_price），gitignore。
@@ -44,13 +47,22 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 - T0/T1 ETF 池：ETF 统一走深水方案（日线 Fisher < -2），按 trade_n 拆分；不走 MACD
 - 持仓：60 分钟 Fisher 下穿预警，无命中不推送
 
-信号：fish2 = fish1[1]，上穿 = Fisher 由跌转升拐点，只判断最新已完结 60 分钟 bar。
+信号：fish2 = fish1[1]，上穿 = Fisher 由跌转升拐点。默认只判最新已完结 60 分钟 bar；
+`--live` 时盘中未完结 bar 也参与判定（命中带 `bar_state=未完结`，推送标注「盘中信号」）。
+`notify()` 按 `{日期}|{鱼塘}|{side}|{code}|{bar_time}` 去重（cache/pushed_signals.json），
+同一根 bar 的同一信号当日只推一次（盘中推过后收盘确认不重复推送）。
 
-## 计划任务（Windows schtasks，周一到周五）
+## 计划任务（Windows schtasks）
 
-- `fisher_建池` 00:00 → build_pool.cmd（gm 建五池，**需掘金终端运行并登录**）
-- `fisher_扫描1031/1131/1401/1501` → scan_all.cmd
+- `fisher_建池` 00:00 周一~周五 → build_pool.cmd（gm 建五池，**需掘金终端运行并登录**）
+- `fisher_持仓` 每天 9:31–15:20 每 15 分钟 → scan_holdings.cmd
+  （daily 任务，周末由 run_scan.py 内的 weekday 保护直接退出；节假日空跑但不会重复推送，去重兜底）
+- `fisher_扫描1016/1116/1346/1446` 周一~周五 → scan_mid.cmd（bar 中段，--live 盘中信号）
+- `fisher_扫描1031/1131/1401/1501` 周一~周五 → scan_all.cmd（bar 收盘后，完结确认）
 - 任务经 run_hidden.vbs 隐藏运行。
+- 所有 fisher 任务已开启「错过计划启动后尽快补跑」（StartWhenAvailable）：
+  电脑睡眠/关机错过触发点时，唤醒后会自动补跑一次（2026-08-26 起）。
+- `build_pool_gm.py` 盘中（15:30 前）运行时自动剔除当日未完结日 K，避免半成品 bar 污染指标。
 - 重建命令见 使用说明.md。查询：`schtasks /query | findstr fisher`
 
 ## 数据通道（降级链：tdx → sina → gm）
@@ -63,8 +75,9 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 - **gm**：掘金，须 .venv-gm 且终端运行；免费版 60m 历史有配额（报 status 1014），只作兜底。
 - **em（东财）**：push2his K 线接口被本机网络 WAF 按 TLS 指纹封锁，不可用。
 
-`run_scan.py` 是盘中扫描调度器：依次扫 5 个池 + 持仓下穿，通道失败率 >50% 自动降级。
-`fisher_scanner.py --source tdx|sina|gm|em` 可手动指定通道。
+`run_scan.py` 是盘中扫描调度器：优先扫持仓（下穿+上穿）和深水池，再扫右/左/T0/T1/观察池，通道失败率 >50% 自动降级。
+参数：`--holdings` 只扫持仓两项（每 15 分钟任务用）；`--live` 盘中未完结 bar 参与判定（中段任务用）；无参数 = 全量完结确认。
+`fisher_scanner.py --source tdx|sina|gm|em` 可手动指定通道，`--live` 可手动跑盘中信号。
 
 ## 踩过的坑（改代码前必读）
 
@@ -95,6 +108,8 @@ Fisher Transform 上穿信号（买入），持仓股监控下穿信号（卖出
 
 - 登记持仓：`.venv\Scripts\python.exe fisher_scanner.py --buy 600036 --price 38.86`
 - 手动扫描：`.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv`
+  （加 `--live` 判盘中未完结 bar）
+- 手动持仓监控：`.venv\Scripts\python.exe run_scan.py --holdings --live`
 - 手动建池：`.venv-gm\Scripts\python.exe build_pool_gm.py`
 - 推送渠道：企业微信机器人 webhook（webhook.key），notify() 已实现，按池文件名
   自动区分推送文案（右侧/左侧/深水/T0/T1/持仓鱼塘）。

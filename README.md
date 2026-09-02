@@ -1,7 +1,8 @@
 # Fisher Transform 60 分钟线「刚上穿」扫描器（沪深 A 股）
 
-基于 akshare 的盘中实时预警脚本。每个 60 分钟 bar 收盘后扫描股票池，
-选出**最新完结 bar 刚发生 Fisher 上穿 Trigger** 的股票。
+基于 akshare 的盘中实时预警脚本。扫描股票池，选出**刚发生 Fisher 上穿 Trigger** 的股票。
+信号分两类：**完结确认**（60 分钟 bar 收盘后判定）和**盘中信号**（`--live`，bar 未走完就判定，
+可能收盘前消失/翻转，推送会标注「未完结」）。同一根 bar 的同一信号当日只推一次。
 
 数据源由 `fisher_scanner.py` 配置区的 `DATA_SOURCE`（或 `--source` 参数）决定：
 
@@ -30,7 +31,9 @@ fisher_60min_scanner/
 ├── fisher_scanner.py    # 主程序（配置区在文件头部，参数可调）
 ├── build_pool_gm.py     # 五池生成器（掘金 gm 版，当前默认；跑在 .venv-gm）
 ├── build_pool_dual.py   # 三池生成器（新浪版，备用）
-├── scan_all.cmd         # 定时任务入口：五个池 + 持仓下穿 依次扫描
+├── scan_all.cmd         # 定时任务入口：全部池 + 持仓，完结确认（bar 收盘后）
+├── scan_mid.cmd         # bar 中段扫描入口（--live，盘中信号）
+├── scan_holdings.cmd    # 持仓每 15 分钟监控入口（--holdings --live）
 ├── build_pool.cmd       # 建池任务入口（gm 版）
 ├── run_hidden.vbs       # 隐藏控制台启动器（计划任务经它调用 .cmd，不弹窗）
 ├── holdings.csv         # 持仓清单（--buy 登记，下穿监控对象）
@@ -43,8 +46,10 @@ fisher_60min_scanner/
 
 ## 每日工作流（推荐）
 
-全自动：Windows 计划任务工作日 00:00 建池（gm 版），盘中 10:31/11:31/14:01/15:01
-扫描全部五个池 + 持仓下穿并推送企业微信（见下文「正式运行」）。
+全自动：Windows 计划任务工作日 00:00 建池（gm 版）；盘中每根 60 分钟 bar 的中段
+（10:16/11:16/13:46/14:46）扫盘中信号（未完结 bar）、收盘后（10:31/11:31/14:01/15:01）
+扫完结确认，全部池 + 持仓并推送企业微信；持仓另加每 15 分钟（9:31 起）高频监控
+（见下文「正式运行」）。
 
 手动命令：
 
@@ -169,21 +174,33 @@ pip install -r requirements.txt
 1  15 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
 ```
 
-Windows 已在「任务计划程序」注册 5 个任务（用 `schtasks /query | findstr fisher` 查看）：
+Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query | findstr fisher` 查看）：
 
 | 任务名 | 触发 | 动作 |
 |---|---|---|
 | `fisher_建池` | 工作日 00:00 | `build_pool.cmd`（gm 重建五池，需掘金终端运行） |
-| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：依次扫右侧/左侧/深水/T0/T1/持仓下穿，推送企业微信 |
+| `fisher_持仓` | 每天 9:31–15:20 每 15 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
+| `fisher_扫描1016` / `1116` / `1346` / `1446` | 工作日对应时刻 | `scan_mid.cmd`：全部池 + 持仓，**盘中信号**（未完结 bar） |
+| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：全部池 + 持仓，**完结确认**（bar 收盘后） |
 
-所有任务经 `run_hidden.vbs` 隐藏启动，不弹控制台窗口。
+所有任务经 `run_hidden.vbs` 隐藏启动，不弹控制台窗口；均已开启
+「错过计划启动后尽快补跑」（StartWhenAvailable）。
 
 注册命令（任务不存在或需重建时执行）：
 
 ```cmd
 schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
+schtasks /create /f /tn "fisher_持仓" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_holdings.cmd" /sc minute /mo 15 /st 09:31 /et 15:20
+schtasks /create /f /tn "fisher_扫描1016" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_mid.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:16
+:: 1116 / 1346 / 1446 三条同上（scan_mid.cmd），仅改 /tn 与 /st
 schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_all.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
-:: 1131 / 1401 / 1501 三条同上，仅改 /tn 与 /st
+:: 1131 / 1401 / 1501 三条同上（scan_all.cmd），仅改 /tn 与 /st
+```
+
+补跑开关（新注册任务需执行一次）：
+
+```powershell
+Get-ScheduledTask -TaskName "任务名" | ForEach-Object { $_.Settings.StartWhenAvailable = $true; $_ } | Set-ScheduledTask
 ```
 
 结果 CSV 文件名带 `_right` / `_left` / `_deep` / `_t0` / `_t1` / `_holdings` 后缀区分。
@@ -204,9 +221,10 @@ schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hid
 | 列 | 含义 |
 |---|---|
 | code / name | 股票代码 / 名称 |
-| bar_time | 发生上穿的 bar 时刻（应为最近一次 bar 收盘时刻） |
-| close | 该 bar 收盘价（前复权） |
+| bar_time | 发生上穿的 bar 时刻（bar 结束时刻） |
+| close | 该 bar 收盘价（盘中信号为当时最新价） |
 | fisher / trigger | 该 bar 的 Fisher / Trigger 值 |
+| bar_state | 完结 / 未完结（盘中信号，收盘前可能消失或翻转） |
 
 推送已内置：扫描结果通过**企业微信机器人**推送到微信。配置方式：把 webhook 地址写入项目目录的
 `webhook.key` 文件（一行，已在 .gitignore 中），或设置环境变量 `FISHER_WECOM_WEBHOOK`；
@@ -214,8 +232,10 @@ schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hid
 
 ## 重要注意事项
 
-1. **盘中判定**：脚本会自动丢弃正在形成中的最后一根 bar（价格未走完会信号闪烁），
-   只对已完结 bar 做判断。所以运行时刻必须晚于 bar 收盘时刻，建议照上文 +1 分钟。
+1. **盘中判定**：默认脚本自动丢弃正在形成中的最后一根 bar（价格未走完会信号闪烁），
+   只对已完结 bar 做判断；加 `--live` 则未完结 bar 也参与判定（中段扫描任务使用，
+   推送会标注「未完结」）。同一根 bar 的同一信号当日只推一次（`cache/pushed_signals.json` 去重），
+   完结确认任务照常在 bar 收盘后运行。
 2. **限流**：全市场约 5000 只，默认每只间隔 0.25 秒，东财源一轮约 30~45 分钟（新浪源每股 2 次请求，约 1~1.5 小时）。
    接口对频繁请求可能限流，脚本已带重试；若失败数偏多，把 `REQUEST_INTERVAL` 调大到 0.4~0.5。
    **强烈建议先用日线等条件预筛股票池**（如非 ST、成交额、趋势），存成含 `code` 列的 CSV，
