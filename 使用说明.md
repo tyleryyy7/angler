@@ -47,7 +47,7 @@ fisher_60min_scanner/
 ## 每日工作流（推荐）
 
 全自动：Windows 计划任务工作日 00:00 建池（gm 版）；盘中每根 60 分钟 bar 的中段
-（10:16/11:16/13:46/14:46）扫盘中信号（未完结 bar）、收盘后（10:31/11:31/14:01/15:01）
+（10:01/11:01/13:31/14:31，四根 bar 的中点）扫盘中信号（未完结 bar）、收盘后（10:31/11:31/14:01/15:01）
 扫完结确认，全部池 + 持仓并推送企业微信；持仓另加每 15 分钟（9:31 起）高频监控
 （见下文「正式运行」）。
 
@@ -180,7 +180,7 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 |---|---|---|
 | `fisher_建池` | 工作日 00:00 | `build_pool.cmd`（gm 重建五池，需掘金终端运行） |
 | `fisher_持仓` | 每天 9:31–15:20 每 15 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
-| `fisher_扫描1016` / `1116` / `1346` / `1446` | 工作日对应时刻 | `scan_mid.cmd`：全部池 + 持仓，**盘中信号**（未完结 bar） |
+| `fisher_扫描1001` / `1101` / `1331` / `1431` | 工作日对应时刻 | `scan_mid.cmd`：全部池 + 持仓，**盘中信号**（未完结 bar） |
 | `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：全部池 + 持仓，**完结确认**（bar 收盘后） |
 
 所有任务经 `run_hidden.vbs` 隐藏启动，不弹控制台窗口；均已开启
@@ -191,8 +191,8 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 ```cmd
 schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
 schtasks /create /f /tn "fisher_持仓" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_holdings.cmd" /sc minute /mo 15 /st 09:31 /et 15:20
-schtasks /create /f /tn "fisher_扫描1016" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_mid.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:16
-:: 1116 / 1346 / 1446 三条同上（scan_mid.cmd），仅改 /tn 与 /st
+schtasks /create /f /tn "fisher_扫描1001" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_mid.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:01
+:: 1101 / 1331 / 1431 三条同上（scan_mid.cmd），仅改 /tn 与 /st
 schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_all.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
 :: 1131 / 1401 / 1501 三条同上（scan_all.cmd），仅改 /tn 与 /st
 ```

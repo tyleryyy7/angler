@@ -57,7 +57,7 @@
 - `fisher_建池` 00:00 周一~周五 → build_pool.cmd（gm 建五池，**需掘金终端运行并登录**）
 - `fisher_持仓` 每天 9:31–15:20 每 15 分钟 → scan_holdings.cmd
   （daily 任务，周末由 run_scan.py 内的 weekday 保护直接退出；节假日空跑但不会重复推送，去重兜底）
-- `fisher_扫描1016/1116/1346/1446` 周一~周五 → scan_mid.cmd（bar 中段，--live 盘中信号）
+- `fisher_扫描1001/1101/1331/1431` 周一~周五 → scan_mid.cmd（bar 中段，--live 盘中信号）
 - `fisher_扫描1031/1131/1401/1501` 周一~周五 → scan_all.cmd（bar 收盘后，完结确认）
 - 任务经 run_hidden.vbs 隐藏运行。
 - 所有 fisher 任务已开启「错过计划启动后尽快补跑」（StartWhenAvailable）：
