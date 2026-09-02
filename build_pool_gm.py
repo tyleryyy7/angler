@@ -144,8 +144,13 @@ def fetch_universe():
 def fetch_daily(symbol):
     """拉近 HIST_DAYS 天前复权日线，带重试。失败返回 None。"""
     from gm.api import history, ADJUST_PREV
-    end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    start = (datetime.now() - timedelta(days=HIST_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
+    if now.hour < 15 or (now.hour == 15 and now.minute < 30):
+        # 盘中建池：剔除当日未完结日 K，避免半成品 bar 污染 MACD/Fisher
+        end = (now - timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
+    else:
+        end = now.strftime("%Y-%m-%d %H:%M:%S")
+    start = (now - timedelta(days=HIST_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
     for k in range(RETRY):
         try:
             df = history(symbol=symbol, frequency="1d", start_time=start, end_time=end,
