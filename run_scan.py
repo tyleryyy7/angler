@@ -16,6 +16,7 @@
     .venv\\Scripts\\python.exe run_scan.py              # 全量扫描，只判完结 bar（收盘后任务）
     .venv\\Scripts\\python.exe run_scan.py --live             # 全量扫描，盘中未完结 bar 也参与判定（bar 中段任务）
     .venv\\Scripts\\python.exe run_scan.py --holdings --live     # 只扫持仓（每 15 分钟任务）
+    .venv\\Scripts\\python.exe run_scan.py --hssr-report          # Fisher-ESI 台账 HSSR 周报（每周日任务）
 """
 
 import argparse
@@ -76,19 +77,21 @@ def push_alert(text):
 
 
 def scan_with_failover(pool, pool_file, pond, tag, side, live=False):
-    """降级链：tdx（通达信，进程内）→ sina（进程内）→ gm（.venv-gm 子进程）。"""
+    """降级链：tdx（通达信，进程内）→ sina（进程内）→ gm（.venv-gm 子进程）。
+    返回进程内扫描结果 DataFrame；走 gm 子进程兜底时返回 None（该进程自行推送）。"""
     for source in CHANNELS:
         result = fs.scan(pool, label=tag, side=side, source=source, live=live)
         total = result.attrs.get("total", 0)
         fails = result.attrs.get("fails", 0)
         if not total or fails / total <= FAIL_RATE_LIMIT:
             fs.notify(result, pond, side=side)
-            return
+            return result
         logging.warning("%s 通道失败率 %.0f%%（%d/%d），切换下一通道: %s",
                         source, fails / total * 100, fails, total, pool_file)
     # gm 兜底（跨环境子进程，自行推送）
     if run_gm_scan(pool_file, side, live=live) != 0:
         push_alert("**%s：三通道均不可用（tdx/sina/gm），本次扫描缺失**" % pond)
+    return None
 
 
 def main():
@@ -97,10 +100,32 @@ def main():
                         help="只扫持仓（下穿+上穿），用于每 15 分钟持仓监控")
     parser.add_argument("--live", action="store_true",
                         help="盘中信号：未完结的 60 分钟 bar 也参与判定")
+    parser.add_argument("--daily-confirm", action="store_true",
+                        help="深水池日共振收盘复核（60m 日内上穿 + 当日日 K 上穿）")
+    parser.add_argument("--hssr-report", action="store_true",
+                        help="推送 Fisher-ESI 台账 HSSR 周报（每周日任务，须在周末保护之前）")
     args = parser.parse_args()
+
+    if args.hssr_report:
+        fs.push_text(fs.hssr_report())
+        return
 
     if datetime.now().weekday() >= 5:
         logging.info("周末不交易，退出")
+        return
+
+    if args.daily_confirm:
+        p = BASE / "pool_deep.csv"
+        if not p.exists():
+            logging.info("pool_deep.csv 不存在，跳过")
+            return
+        pool = pd.read_csv(p, dtype={"code": str})
+        if len(pool) == 0:
+            logging.info("pool_deep.csv 为空，跳过")
+            return
+        result = fs.scan_deep_resonance(pool)
+        if len(result):
+            fs.notify(result, "深水日共振", "up")
         return
 
     pools = [p for p in POOLS if p[0] == "holdings.csv"] if args.holdings else POOLS
@@ -115,8 +140,20 @@ def main():
             continue
 
         fake_args = SimpleNamespace(pool_file=pool_file)
-        scan_with_failover(pool, pool_file, fs.pool_label(fake_args),
-                           fs.pool_tag(fake_args), side, live=args.live)
+        result = scan_with_failover(pool, pool_file, fs.pool_label(fake_args),
+                                    fs.pool_tag(fake_args), side, live=args.live)
+        # Fisher-ESI：持仓完结 60m 上穿 → 进场登记（台账去重：open/当日 failed 跳过）
+        if args.holdings and side == "up" and result is not None and len(result):
+            fs.esi_register_entries(result)
+
+    # Fisher-ESI 失效判定：只在 30m bar 收盘后窗口跑（每 15 分钟持仓任务的网格上）
+    if args.holdings:
+        now = datetime.now()
+        hm = now.strftime("%H:%M")
+        if any(a <= hm <= b for a, b in fs.ESI_JUDGE_WINDOWS):
+            esi_result = fs.esi_check_invalidation(now)
+            if esi_result is not None and len(esi_result):
+                fs.notify(esi_result, "Fisher失效", "down")
 
 
 if __name__ == "__main__":
