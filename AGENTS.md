@@ -22,7 +22,7 @@
 - `scan_holdings.cmd` — 持仓每 15 分钟监控入口：`run_scan.py --holdings --live`（CRLF）。
 - `scan_daily.cmd` — 深水池日共振收盘复核入口：`run_scan.py --daily-confirm`（CRLF）。
 - `scan_hssr.cmd` — HSSR 周报入口：`run_scan.py --hssr-report`（CRLF）。
-- `build_pool.cmd` — 建池任务入口（CRLF）：gm 建五池 + `.venv` 深水池 HSSR 注解两步。
+- `build_pool.cmd` — 建池任务入口（CRLF）：`.build_lock` 互斥锁 + gm 建五池 + `.venv` 深水池 HSSR 注解。
 - `run_hidden.vbs` — 隐藏控制台启动器，所有计划任务经它调用 .cmd（防弹窗）。
 - `holdings.csv` — 用户持仓（code,name,buy_date,buy_price），gitignore。
 - `watchlist.csv` — 观察池（清仓/放过但继续盯上穿回钩的票），gitignore。
@@ -51,7 +51,8 @@
   （score_deep：下跌减速30%/位置支撑25%/资金CMF20%/周线共振15%/极端度10%）。
   附 HSSR 预计算列 hssr/hssr_n（价格版：历史 60m 完结 bar 上穿后 10 根 close 上涨记成功，
   取最近 20 次可评估信号，样本 <5 留空），由建池后 .venv 注解步骤
-  （`fisher_scanner.py --annotate-hssr`，走 tdx 800 根深历史）写回 pool_deep.csv；
+  （`fisher_scanner.py --annotate-hssr`，默认走 tdx 800 根深历史；
+  `--source sina` 强制新浪（串行 1.5s/股防限流）；`--source auto` 则 tdx 失败后 sina 兜底）写回 pool_deep.csv；
   深水推送按档位附仓位建议：≥75% 正常仓位、50-75% 仓位减半、<50% 不建议买入、
   样本不足标「HSSR 样本不足 (n<5)」
 - T0/T1 ETF 池：ETF 统一走深水方案（日线 Fisher < -2），按 trade_n 拆分；不走 MACD
@@ -107,6 +108,7 @@
   `fetch_30m` 用 `KlineCategory.MIN_30`、count=600（单次上限 800，保证 Fisher 暖机），
   时间映射循环已抽成 `_tdx_map_bar_times(df, bar_ends)` 供 60m/30m 共用。
 - **sina**：akshare，前复权准，但会限流（HTTP 456，冷却几十分钟自愈）。
+  HSSR 注解可用 `--source sina` 或 `--source auto`（tdx 失败后自动切 sina，串行 1.5s/股防限流）。
 - **gm**：掘金，须 .venv-gm 且终端运行；免费版 60m 历史有配额（报 status 1014），只作兜底。
   HSSR 预计算需要的 800 根 60m 深历史走 tdx（`fetch_60m(code, count=800)`，
   gm 配额坑不可用于此，注解步骤绝不放 gm 脚本）。
@@ -140,6 +142,11 @@
    `{"status": 1014, "message": "历史行情服务调用错误"}`，所以 gm 不作扫描主通道。
 10. gm `get_symbols(skip_st=True)` 的 is_st 标志不完整（实测 ST龙津/ST洲际 漏剔），
     建池必须叠加名称过滤 `~sec_name.str.contains("ST|退")`。
+11. **建池并发写坏池文件**（2026-09-09 实发）：fisher_建池 的 StartWhenAvailable 补跑
+    与手动 build_pool.cmd 同时运行，两轮 gm 建池交错，增量 save_results 用未完成的
+    深水池（38 只）覆盖完整池（127 只），随后 HSSR 注解按 38 只写回。build_pool.cmd
+    已加 `.build_lock` 目录互斥锁（第二个实例直接退出），**手动补跑前确认没有别的
+    建池在跑**；异常中断残留 .build_lock 时手动 `rmdir .build_lock`。
 
 ## 常用操作
 

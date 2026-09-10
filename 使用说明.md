@@ -37,7 +37,7 @@ fisher_60min_scanner/
 ├── scan_holdings.cmd    # 持仓每 15 分钟监控入口（--holdings --live）
 ├── scan_daily.cmd       # 深水池日共振收盘复核入口（--daily-confirm，15:10）
 ├── scan_hssr.cmd        # HSSR 周报入口（--hssr-report，每周日 20:00）
-├── build_pool.cmd       # 建池任务入口（gm 建五池 + .venv 深水池 HSSR 注解两步）
+├── build_pool.cmd       # 建池任务入口（.build_lock 互斥锁 + gm 建五池 + .venv 深水池 HSSR 注解）
 ├── run_hidden.vbs       # 隐藏控制台启动器（计划任务经它调用 .cmd，不弹窗）
 ├── holdings.csv         # 持仓清单（--buy 登记，下穿监控对象）
 ├── AGENTS.md            # AI 助手交接文档
@@ -60,8 +60,14 @@ fisher_60min_scanner/
 # 建池（掘金 gm 版，约 1 分钟；需掘金终端运行并登录）
 .venv-gm\Scripts\python.exe build_pool_gm.py
 
-# 深水池 HSSR 注解（主环境 .venv，tdx 800 根深历史；build_pool.cmd 已含此步）
+# 深水池 HSSR 注解（主环境 .venv，默认 tdx 800 根深历史；build_pool.cmd 已含此步）
 .venv\Scripts\python.exe fisher_scanner.py --annotate-hssr
+
+# tdx 夜间不可用时，用 sina 兜底（串行 1.5s/股防限流，约 4 分钟）
+.venv\Scripts\python.exe fisher_scanner.py --annotate-hssr --source sina
+
+# tdx 优先、失败票自动切 sina 兜底
+.venv\Scripts\python.exe fisher_scanner.py --annotate-hssr --source auto
 
 # 盘中扫描（按池选用）
 .venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv
@@ -140,7 +146,8 @@ pip install -r requirements.txt
 注解步骤（`build_pool.cmd` 第二步，或手动 `fisher_scanner.py --annotate-hssr`）
 对每只股票回测历史 60m 完结 bar 上穿信号——信号出现后 10 根 bar close 上涨记成功，
 取最近 20 次可评估信号（最后 10 根 bar 内的信号不可评估，剔除），样本 < 5 留空。
-深历史走 tdx 800 根（约 200 交易日）；gm 60m 批量拉取有配额限制，不可用于此。
+深历史走 tdx 800 根（约 200 交易日）；tdx 夜间不可用时可用 `--source sina`（串行防限流）
+或 `--source auto`（tdx 失败后自动切 sina）兜底；gm 60m 批量拉取有配额限制，不可用于此。
 深水推送按档位附仓位建议：≥75% 正常仓位；50–75% 仓位减半；<50% 不建议买入；
 样本不足标注「HSSR 样本不足 (n<5)」。
 

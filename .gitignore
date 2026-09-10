@@ -19,3 +19,4 @@ gm_progress.txt
 results/
 scanner.log
 cache/
+.build_lock/

@@ -979,13 +979,15 @@ HSSR_N_SIGNALS = 20     # 统计窗口：最近 N 次可评估信号
 HSSR_MIN_SAMPLE = 5     # 可评估样本少于此数视为样本不足（hssr 留空）
 
 
-def compute_hssr(code, n_hold=HSSR_N_HOLD, n_signals=HSSR_N_SIGNALS):
+def compute_hssr(code, n_hold=HSSR_N_HOLD, n_signals=HSSR_N_SIGNALS, source="tdx"):
     """单只股票 60m 历史上穿信号成功率。返回 (hssr 百分数或 None, n_eval)。
 
     样本不足（n_eval < HSSR_MIN_SAMPLE）返回 (None, n_eval)；取数失败返回 (None, 0)。
+    source: tdx（默认，800 根深历史）/ sina（夜间 fallback，串行防限流）。
     """
-    df = fetch_60m(code, source="tdx", count=800)
-    time.sleep(REQUEST_INTERVAL)
+    df = fetch_60m(code, source=source, count=800)
+    # sina 限流严格，拉长间隔；tdx 保持原速
+    time.sleep(1.5 if source == "sina" else REQUEST_INTERVAL)
     if df is None:
         return None, 0
     high = pd.to_numeric(df["最高"], errors="coerce").values
@@ -1002,11 +1004,12 @@ def compute_hssr(code, n_hold=HSSR_N_HOLD, n_signals=HSSR_N_SIGNALS):
     return round(wins / n_eval * 100, 1), n_eval
 
 
-def annotate_pool_hssr(pool_file="pool_deep.csv"):
+def annotate_pool_hssr(pool_file="pool_deep.csv", source="tdx"):
     """建池后注解步骤：为池内每只股票预计算 HSSR，新增 hssr/hssr_n 两列写回原文件。
 
-    主环境 .venv 运行（tdx 深历史，进程池并发）；整体 try/except，
-    任何异常保留原文件不破坏。hssr 为百分数数值（样本不足留空），hssr_n 为可评估样本数。
+    主环境 .venv 运行；整体 try/except，任何异常保留原文件不破坏。
+    hssr 为百分数数值（样本不足留空），hssr_n 为可评估样本数。
+    source: tdx（默认，进程池并发）/ sina（串行防限流）/ auto（tdx 失败后 sina 兜底）。
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
     path = Path(__file__).resolve().parent / pool_file
@@ -1017,16 +1020,32 @@ def annotate_pool_hssr(pool_file="pool_deep.csv"):
         pool = pd.read_csv(path, dtype={"code": str})
         n = len(pool)
         t0 = time.time()
-        results, done = {}, 0
-        with ProcessPoolExecutor(max_workers=WORKERS) as ex:
-            futures = {ex.submit(compute_hssr, str(c)): str(c) for c in pool["code"]}
-            for fut in as_completed(futures):
-                results[futures[fut]] = fut.result()
-                done += 1
-                if done % 20 == 0:
-                    logging.info("HSSR 注解进度 %d/%d", done, n)
-        pool["hssr"] = pool["code"].map(lambda c: results[str(c)][0])
-        pool["hssr_n"] = pool["code"].map(lambda c: results[str(c)][1])
+        results = {}
+
+        def _run(src, codes):
+            if not codes:
+                return
+            workers = 1 if src == "sina" else WORKERS
+            done = 0
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(compute_hssr, str(c), source=src): str(c) for c in codes}
+                for fut in as_completed(futures):
+                    results[futures[fut]] = fut.result()
+                    done += 1
+                    if done % 20 == 0:
+                        logging.info("HSSR 注解进度 %d/%d (%s)", done, len(codes), src)
+
+        if source == "auto":
+            _run("tdx", pool["code"].tolist())
+            failed = [c for c in pool["code"] if results.get(str(c), (None, 0))[0] is None]
+            if failed:
+                logging.info("tdx 失败/样本不足 %d 只，切 sina 兜底", len(failed))
+                _run("sina", failed)
+        else:
+            _run(source, pool["code"].tolist())
+
+        pool["hssr"] = pool["code"].map(lambda c: results.get(str(c), (None, 0))[0])
+        pool["hssr_n"] = pool["code"].map(lambda c: results.get(str(c), (None, 0))[1])
         pool.to_csv(path, index=False, encoding="utf-8-sig")
         ok = pool["hssr"].notna().sum()
         logging.info("HSSR 注解完成：%d 只耗时 %.1f 分钟，有效 %d 只，样本不足/失败 %d 只，已写回 %s",
@@ -1352,8 +1371,9 @@ def main():
     parser.add_argument("--limit", type=int, help="只扫描前 N 只（调试）")
     parser.add_argument("--side", choices=["up", "down"], default="up",
                         help="up=上穿（默认，选股），down=下穿（持仓监控）")
-    parser.add_argument("--source", choices=["sina", "gm", "em", "tdx"], default=None,
-                        help="数据源（缺省用配置区 DATA_SOURCE）；gm 须在 .venv-gm 环境运行")
+    parser.add_argument("--source", choices=["sina", "gm", "em", "tdx", "auto"], default=None,
+                        help="数据源（缺省用配置区 DATA_SOURCE）；gm 须在 .venv-gm 环境运行；"
+                             "auto 仅用于 --annotate-hssr（tdx 失败后 sina 兜底）")
     parser.add_argument("--buy", metavar="CODE", help="登记买入到 holdings.csv 后退出")
     parser.add_argument("--price", type=float, help="买入价（配合 --buy，缺省取最新价）")
     parser.add_argument("--sell", metavar="CODE", help="清仓：移出持仓并加入观察池后退出")
@@ -1367,7 +1387,8 @@ def main():
                         help="推送 Fisher-ESI 台账 HSSR 周报后退出")
     parser.add_argument("--annotate-hssr", action="store_true",
                         help="深水池 HSSR 预计算：为 --pool-file（默认 pool_deep.csv）"
-                             "追加 hssr/hssr_n 两列后退出（主环境 .venv，走 tdx 800 根深历史）")
+                             "追加 hssr/hssr_n 两列后退出（主环境 .venv，默认走 tdx 800 根深历史；"
+                             "--source sina 强制新浪；--source auto 则 tdx 失败后 sina 兜底）")
     parser.add_argument("--inspect", metavar="CODE或名称",
                         help="单票体检：输出该票完整画像（身份/日线/60m/30m+ESI/HSSR）后退出；"
                              "名称从各池/持仓/观察池 CSV 反查代码")
@@ -1380,7 +1401,8 @@ def main():
         inspect_stock(args.inspect, push=args.push, source=source)
         return
     if args.annotate_hssr:
-        annotate_pool_hssr(args.pool_file or "pool_deep.csv")
+        src = args.source or "tdx"
+        annotate_pool_hssr(args.pool_file or "pool_deep.csv", source=src)
         return
     if args.hssr_report:
         push_text(hssr_report())
