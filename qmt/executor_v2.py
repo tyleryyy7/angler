@@ -155,11 +155,14 @@ def handlebar(ContextInfo):
         pos, cost = get_position(code)
         cross_up = len(f) >= 3 and f[-1] > f[-2] and f[-2] <= f[-3]
         cross_down = len(f) >= 3 and f[-1] < f[-2] and f[-2] >= f[-3]
+        # dedup key = 1h fisher state (identifies the 1h bar; barpos changes every
+        # 5m tick when strategy runs on 5m period, so it cannot be the key)
+        key1h = '%.4f|%.4f|%.4f' % (f[-1], f[-2], f[-3])
 
         print('[%s] %s fish60=%.3f trig=%.3f pos=%d' % (bar_key, code, f60, t60, pos))
 
         if pos == 0:
-            if cross_up and LAST_ACT.get((code, 'BUY')) != bar_key:
+            if cross_up and LAST_ACT.get((code, 'BUY')) != key1h:
                 if USE_ENTRY_GATE:
                     downs = []
                     for tf in ('30m', '15m', '5m'):
@@ -178,7 +181,7 @@ def handlebar(ContextInfo):
                               '(fake-invalid, watching)' % (code, '/'.join(downs)))
                         continue
                 do_order(ContextInfo, code, 23, VOLUME)
-                LAST_ACT[(code, 'BUY')] = bar_key
+                LAST_ACT[(code, 'BUY')] = key1h
                 PENDING.pop(code, None)
                 print('>>> BUY %s %d shares, fish60=%.3f' % (code, VOLUME, f60))
                 continue
@@ -201,20 +204,20 @@ def handlebar(ContextInfo):
                     ups = False
                     break
             if ups:
-                if LAST_ACT.get((code, 'BUY')) == bar_key:
+                if LAST_ACT.get((code, 'BUY')) == key1h:
                     continue
                 do_order(ContextInfo, code, 23, VOLUME)
-                LAST_ACT[(code, 'BUY')] = bar_key
+                LAST_ACT[(code, 'BUY')] = key1h
                 PENDING.pop(code, None)
                 print('>>> BUY %s %d shares (REACTIVATED after fake-invalid), '
                       'fish60=%.3f' % (code, VOLUME, f60))
 
         else:
-            if cross_down:
-                if LAST_ACT.get((code, 'SELL')) == bar_key:
+            if cross_down and USE_EXIT_A:
+                if LAST_ACT.get((code, 'SELL')) == key1h:
                     continue
                 do_order(ContextInfo, code, 24, pos)
-                LAST_ACT[(code, 'SELL')] = bar_key
+                LAST_ACT[(code, 'SELL')] = key1h
                 print('>>> SELL %s %d shares (1h cross down), fish60=%.3f'
                       % (code, pos, f60))
                 continue
@@ -238,10 +241,11 @@ def handlebar(ContextInfo):
                           % (code, cost, price))
                     continue
                 if price < cost:
-                    if LAST_ACT.get((code, 'ESI')) == bar_key:
+                    key30 = '%.4f|%.4f' % (f30[-2], f30[-3])
+                    if LAST_ACT.get((code, 'ESI')) == key30:
                         continue
                     do_order(ContextInfo, code, 24, pos)
-                    LAST_ACT[(code, 'ESI')] = bar_key
+                    LAST_ACT[(code, 'ESI')] = key30
                     print('>>> ESI-SELL %s %d shares (30m down, price %.2f < cost %.2f)'
                           % (code, pos, price, cost))
                 # floating profit: keep holding for Exit A
