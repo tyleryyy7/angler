@@ -23,6 +23,7 @@ LENGTH = 9                   # fisher window
 HIST_BARS = 120              # bars fetched per timeframe per call
 VOLUME = 100                 # fixed shares per BUY order
 USE_ENTRY_GATE = True        # R1: small-timeframe resonance gate (30m/15m/5m not down)
+USE_EXIT_A = True            # Exit A: 1h fisher cross down -> sell all (normal exit)
 USE_ESI_EXIT = True          # R3: 30m cross-down + floating loss -> sell immediately
 # ----------------------------------------
 
@@ -181,7 +182,7 @@ def handlebar(ContextInfo):
             print('>>> BUY %s %d shares, fish60=%.3f' % (code, VOLUME, f60))
 
         else:
-            if cross_down:
+            if cross_down and USE_EXIT_A:
                 if LAST_ACT.get((code, 'SELL')) == bar_key:
                     continue
                 do_order(ContextInfo, code, 24, pos)
