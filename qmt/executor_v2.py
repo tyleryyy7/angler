@@ -17,20 +17,22 @@ import math
 
 # ---------------- config ----------------
 ACCOUNT_ID = 'test'          # TODO: set your account id
-WATCHLIST_FILE = r'D:\qmt\watchlist.txt'
+WATCHLIST_FILE = r'D:\qmt\watchlist.txt'   # lines: CODE  or  CODE,VOLUME
+PENDING_FILE = r'D:\qmt\pending.csv'       # persisted R2 watch list (code,signal_key)
 FALLBACK_CODES = ['600519.SH']
 LENGTH = 9                   # fisher window
 HIST_BARS = 120              # bars fetched per timeframe per call
-VOLUME = 100                 # fixed shares per BUY order
+VOLUME = 100                 # default shares per BUY order (per-code override in watchlist)
 USE_ENTRY_GATE = True        # R1: small-timeframe resonance gate (30m/15m/5m not down)
 USE_EXIT_A = True            # Exit A: 1h fisher cross down -> sell all (normal exit)
 USE_ESI_EXIT = True          # R3: 30m cross-down + floating loss -> sell immediately
 # ----------------------------------------
 
 CODES = []
-LAST_ACT = {}                # (code, action) -> bar key, dedup per bar
-PENDING = {}                 # code -> bar_key of fake-invalid signal (R2 watch list,
-                             # in-memory; cleared on strategy restart)
+VOL_MAP = {}                 # code -> per-stock buy volume
+LAST_ACT = {}                # (code, action) -> fisher-state key, dedup per bar
+PENDING = {}                 # code -> signal_key of fake-invalid signal (persisted to
+                             # PENDING_FILE on every change, reloaded in init)
 
 
 def fisher_series(high, low, length):
@@ -115,27 +117,81 @@ def do_order(ContextInfo, code, op, volume):
 
 
 def load_codes():
+    """watchlist lines: CODE  or  CODE,VOLUME (# comments, blank lines ok).
+    Returns (codes, vol_map)."""
     try:
         f = open(WATCHLIST_FILE, 'r', encoding='utf-8')
         lines = f.readlines()
         f.close()
-        codes = [ln.strip() for ln in lines if ln.strip() and not ln.startswith('#')]
+        codes, vol_map = [], {}
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith('#'):
+                continue
+            parts = ln.split(',')
+            code = parts[0].strip()
+            if not code:
+                continue
+            codes.append(code)
+            if len(parts) > 1 and parts[1].strip():
+                try:
+                    vol_map[code] = int(parts[1].strip())
+                except ValueError:
+                    print('[WARN] bad volume in line "%s", use default' % ln)
         if codes:
-            return codes
+            return codes, vol_map
         print('[WARN] watchlist file empty, use fallback')
     except Exception as e:
         print('[WARN] watchlist read failed: %s, use fallback' % e)
-    return list(FALLBACK_CODES)
+    return list(FALLBACK_CODES), {}
+
+
+def pending_load():
+    out = {}
+    try:
+        f = open(PENDING_FILE, 'r', encoding='utf-8')
+        for ln in f:
+            ln = ln.strip()
+            if ln and not ln.startswith('#'):
+                parts = ln.split(',')
+                out[parts[0].strip()] = parts[1].strip() if len(parts) > 1 else ''
+        f.close()
+    except Exception:
+        pass
+    return out
+
+
+def pending_save():
+    try:
+        f = open(PENDING_FILE, 'w', encoding='utf-8')
+        for code, key in PENDING.items():
+            f.write('%s,%s\n' % (code, key))
+        f.close()
+    except Exception as e:
+        print('[WARN] pending save failed: %s' % e)
+
+
+def pending_add(code, key):
+    PENDING[code] = key
+    pending_save()
+
+
+def pending_remove(code):
+    if code in PENDING:
+        PENDING.pop(code, None)
+        pending_save()
 
 
 def init(ContextInfo):
-    global CODES
+    global CODES, VOL_MAP, PENDING
     ContextInfo.strategyName = 'qmt_executor_v2'
     ContextInfo.accountid = ACCOUNT_ID
-    CODES = load_codes()
+    CODES, VOL_MAP = load_codes()
+    PENDING = pending_load()
     ContextInfo.set_universe(CODES)
-    print('=== qmt_executor_v2 start, codes=%s gate=%s esi_exit=%s vol=%d ==='
-          % (CODES, USE_ENTRY_GATE, USE_ESI_EXIT, VOLUME))
+    print('=== qmt_executor_v2 start, codes=%s vol_map=%s gate=%s exit_a=%s esi_exit=%s vol=%d pending=%s ==='
+          % (CODES, VOL_MAP, USE_ENTRY_GATE, USE_EXIT_A, USE_ESI_EXIT, VOLUME,
+             list(PENDING.keys())))
 
 
 def handlebar(ContextInfo):
@@ -176,21 +232,22 @@ def handlebar(ContextInfo):
                     if downs is None:
                         continue
                     if downs:
-                        PENDING[code] = bar_key   # R2: fake-invalid -> watch list
+                        pending_add(code, key1h)   # R2: fake-invalid -> persisted watch list
                         print('[SKIP] %s cross up but %s in down state '
                               '(fake-invalid, watching)' % (code, '/'.join(downs)))
                         continue
-                do_order(ContextInfo, code, 23, VOLUME)
+                vol = VOL_MAP.get(code, VOLUME)
+                do_order(ContextInfo, code, 23, vol)
                 LAST_ACT[(code, 'BUY')] = key1h
-                PENDING.pop(code, None)
-                print('>>> BUY %s %d shares, fish60=%.3f' % (code, VOLUME, f60))
+                pending_remove(code)
+                print('>>> BUY %s %d shares, fish60=%.3f' % (code, vol, f60))
                 continue
 
             # R2 reactivation watch: pending code, no fresh 1h cross needed
             if code not in PENDING:
                 continue
             if f60 < t60:
-                PENDING.pop(code, None)           # 1h trend broken -> void
+                pending_remove(code)              # 1h trend broken -> void
                 print('[VOID] %s fake-invalid signal voided (1h fish below trigger)'
                       % code)
                 continue
@@ -206,11 +263,12 @@ def handlebar(ContextInfo):
             if ups:
                 if LAST_ACT.get((code, 'BUY')) == key1h:
                     continue
-                do_order(ContextInfo, code, 23, VOLUME)
+                vol = VOL_MAP.get(code, VOLUME)
+                do_order(ContextInfo, code, 23, vol)
                 LAST_ACT[(code, 'BUY')] = key1h
-                PENDING.pop(code, None)
+                pending_remove(code)
                 print('>>> BUY %s %d shares (REACTIVATED after fake-invalid), '
-                      'fish60=%.3f' % (code, VOLUME, f60))
+                      'fish60=%.3f' % (code, vol, f60))
 
         else:
             if cross_down and USE_EXIT_A:
