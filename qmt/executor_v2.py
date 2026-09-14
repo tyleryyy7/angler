@@ -29,6 +29,8 @@ USE_ESI_EXIT = True          # R3: 30m cross-down + floating loss -> sell immedi
 
 CODES = []
 LAST_ACT = {}                # (code, action) -> bar key, dedup per bar
+PENDING = {}                 # code -> bar_key of fake-invalid signal (R2 watch list,
+                             # in-memory; cleared on strategy restart)
 
 
 def fisher_series(high, low, length):
@@ -157,32 +159,58 @@ def handlebar(ContextInfo):
         print('[%s] %s fish60=%.3f trig=%.3f pos=%d' % (bar_key, code, f60, t60, pos))
 
         if pos == 0:
-            if not cross_up:
+            if cross_up and LAST_ACT.get((code, 'BUY')) != bar_key:
+                if USE_ENTRY_GATE:
+                    downs = []
+                    for tf in ('30m', '15m', '5m'):
+                        st = tf_state(ContextInfo, code, tf)
+                        if st is None:
+                            downs = None
+                            print('[WARN] %s %s state unknown, skip bar' % (code, tf))
+                            break
+                        if st[2]:
+                            downs.append(tf)
+                    if downs is None:
+                        continue
+                    if downs:
+                        PENDING[code] = bar_key   # R2: fake-invalid -> watch list
+                        print('[SKIP] %s cross up but %s in down state '
+                              '(fake-invalid, watching)' % (code, '/'.join(downs)))
+                        continue
+                do_order(ContextInfo, code, 23, VOLUME)
+                LAST_ACT[(code, 'BUY')] = bar_key
+                PENDING.pop(code, None)
+                print('>>> BUY %s %d shares, fish60=%.3f' % (code, VOLUME, f60))
                 continue
-            if LAST_ACT.get((code, 'BUY')) == bar_key:
+
+            # R2 reactivation watch: pending code, no fresh 1h cross needed
+            if code not in PENDING:
                 continue
-            if USE_ENTRY_GATE:
-                downs = []
-                for tf in ('30m', '15m', '5m'):
-                    st = tf_state(ContextInfo, code, tf)
-                    if st is None:
-                        downs = None
-                        print('[WARN] %s %s state unknown, skip bar' % (code, tf))
-                        break
-                    if st[2]:
-                        downs.append(tf)
-                if downs is None:
+            if f60 < t60:
+                PENDING.pop(code, None)           # 1h trend broken -> void
+                print('[VOID] %s fake-invalid signal voided (1h fish below trigger)'
+                      % code)
+                continue
+            ups = True
+            for tf in ('30m', '15m', '5m'):
+                st = tf_state(ContextInfo, code, tf)
+                if st is None:
+                    ups = None
+                    break
+                if st[2]:                          # still in down state
+                    ups = False
+                    break
+            if ups:
+                if LAST_ACT.get((code, 'BUY')) == bar_key:
                     continue
-                if downs:
-                    print('[SKIP] %s cross up but %s in down state (fake-invalid)'
-                          % (code, '/'.join(downs)))
-                    continue
-            do_order(ContextInfo, code, 23, VOLUME)
-            LAST_ACT[(code, 'BUY')] = bar_key
-            print('>>> BUY %s %d shares, fish60=%.3f' % (code, VOLUME, f60))
+                do_order(ContextInfo, code, 23, VOLUME)
+                LAST_ACT[(code, 'BUY')] = bar_key
+                PENDING.pop(code, None)
+                print('>>> BUY %s %d shares (REACTIVATED after fake-invalid), '
+                      'fish60=%.3f' % (code, VOLUME, f60))
 
         else:
-            if cross_down and USE_EXIT_A:
+            if cross_down:
                 if LAST_ACT.get((code, 'SELL')) == bar_key:
                     continue
                 do_order(ContextInfo, code, 24, pos)
