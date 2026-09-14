@@ -16,6 +16,7 @@ import math
 ACCOUNT_ID = 'test'          # TODO: set your account id
 WATCHLIST_FILE = r'D:\qmt\watchlist.txt'   # must be an ASCII-only path (QMT builtin env misreads non-ASCII)
 FALLBACK_CODES = ['600519.SH']   # used when the watchlist file is unreadable
+PERIOD = '1h'                  # kline period; NOTE: this GJ build rejects '60m', use '1h'
 LENGTH = 9                   # fisher window, same as fisher_scanner.py FISHER_LEN
 HIST_BARS = 120              # bars fetched per handlebar (warmup for fisher)
 VOLUME = 100                 # fixed shares per BUY order
@@ -55,7 +56,7 @@ def fisher_calc3(high, low, length):
 
 def load_codes():
     try:
-        f = open(WATCHLIST_FILE, 'r')
+        f = open(WATCHLIST_FILE, 'r', encoding='utf-8')
         lines = f.readlines()
         f.close()
         codes = []
@@ -107,8 +108,8 @@ def init(ContextInfo):
 def handlebar(ContextInfo):
     for code in CODES:
         try:
-            hd = ContextInfo.get_history_data(HIST_BARS, '60m', 'high', code)
-            ld = ContextInfo.get_history_data(HIST_BARS, '60m', 'low', code)
+            hd = ContextInfo.get_history_data(HIST_BARS, PERIOD, 'high', code)
+            ld = ContextInfo.get_history_data(HIST_BARS, PERIOD, 'low', code)
             high = list(hd[code])
             low = list(ld[code])
         except Exception as e:
