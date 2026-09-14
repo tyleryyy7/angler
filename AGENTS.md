@@ -10,7 +10,7 @@
 ## 文件结构
 
 - `fisher_scanner.py` — 主扫描器（主环境 `.venv` 运行）。信号定义、上穿/下穿判定、
-  并发扫描、企业微信推送、多数据源（tdx/sina/gm/em）。配置区在文件头部。
+  并发扫描、企业微信推送、多数据源（sina/qmt/gm；tdx/em 已失效）。配置区在文件头部。
 - `run_scan.py` — 盘中扫描调度器（`.venv` 运行）：依次扫五池+持仓下穿，通道降级切换。
 - `build_pool_gm.py` — 建池（掘金 gm 版，**当前默认**，`.venv-gm` 运行）。
   产出 pool_right.csv / pool_left.csv / pool_deep.csv / pool_t0.csv / pool_t1.csv。
@@ -32,6 +32,10 @@
 - `cache/esi_ledger.csv` — Fisher-ESI 进出场台账（code,entry_time,entry_fisher60,
   fail_time,fail_fisher30,failed,bars_held,status；status: open/closed），cache/ 整体已 gitignore。
 - `results/`、`scanner.log`、`dual_progress.txt`、`gm_progress.txt` — 运行产物，gitignore。
+- `weekend test/` — 大QMT 内置策略测试资产（2026-09-12 周末完成，已纳入 git）：
+  成果总结 md + fisher_test_daily_v2.py（纯信号日线版，prev off-by-one 已修复）+
+  fisher_trade_test_v1.py（含下单版，零轴离场为占位规则）。架构方向：外部系统出信号
+  → 信号文件（FileIO 已验证可用）→ 大QMT 内置执行器下单（半自动）。
 
 ## 两个 Python 环境（重要，不要混用）
 
@@ -51,8 +55,8 @@
   （score_deep：下跌减速30%/位置支撑25%/资金CMF20%/周线共振15%/极端度10%）。
   附 HSSR 预计算列 hssr/hssr_n（价格版：历史 60m 完结 bar 上穿后 10 根 close 上涨记成功，
   取最近 20 次可评估信号，样本 <5 留空），由建池后 .venv 注解步骤
-  （`fisher_scanner.py --annotate-hssr`，默认走 tdx 800 根深历史；
-  `--source sina` 强制新浪（串行 1.5s/股防限流）；`--source auto` 则 tdx 失败后 sina 兜底）写回 pool_deep.csv；
+  （`fisher_scanner.py --annotate-hssr`，默认走 sina 串行 1.5s/股防限流；
+  `--source auto` 则 tdx 失败后 sina 兜底；tdx 已失效 2026-09-14）写回 pool_deep.csv；
   深水推送按档位附仓位建议：≥75% 正常仓位、50-75% 仓位减半、<50% 不建议买入、
   样本不足标「HSSR 样本不足 (n<5)」
 - T0/T1 ETF 池：ETF 统一走深水方案（日线 Fisher < -2），按 trade_n 拆分；不走 MACD
@@ -96,27 +100,48 @@
 - `build_pool_gm.py` 盘中（15:30 前）运行时自动剔除当日未完结日 K，避免半成品 bar 污染指标。
 - 重建命令见 使用说明.md。查询：`schtasks /query | findstr fisher`
 
-## 数据通道（降级链：tdx → sina → gm）
+## 数据通道（降级链：sina → gm；2026-09-14 起）
 
-- **tdx（默认）**：xmtdx 库（通达信 TCP 协议，纯标准库，主环境 .venv），快、无限流、
-  不需要 akshare；原始数据不复权，现已在 fetch 时乘新浪日线前复权因子（当日缓存，
-  与 sina 分支共用 cache/daily_qfq/，按 bar 日期逐日映射）做近似前复权；
-  因子获取失败时本股退回不复权（log warning），不触发通道降级。
-  注意：tdx 盘中第二根 60m bar 会标 13:00（跨午休怪癖），fetch 时按「当日第几根」
-  映射到 10:30/11:30/14:00/15:00 收盘时刻，勿改回原始时间戳。30m 同理：每天 8 根，
-  `_TDX_BAR_ENDS_30`（10:00/10:30/11:00/11:30/13:30/14:00/14:30/15:00），
-  `fetch_30m` 用 `KlineCategory.MIN_30`、count=600（单次上限 800，保证 Fisher 暖机），
-  时间映射循环已抽成 `_tdx_map_bar_times(df, bar_ends)` 供 60m/30m 共用。
-- **sina**：akshare，前复权准，但会限流（HTTP 456，冷却几十分钟自愈）。
-  HSSR 注解可用 `--source sina` 或 `--source auto`（tdx 失败后自动切 sina，串行 1.5s/股防限流）。
+- **tdx（已失效 2026-09-14，勿用）**：通达信公开行情服务器对本机拒数——TCP 和握手正常，
+  但 K 线请求一律返回空数据（xmtdx 报 `minute datetime: 数据不足`；pytdx 实测同批服务器
+  返回 0 根 bar，确认是服务端行为而非客户端协议 bug）。Go 版 tdx-api（injoyai/tdx）
+  底层走同一批公共服务器，同样不可用，不值得引入。代码保留备查。
+- **sina（默认）**：akshare，前复权准，但会限流（HTTP 456，冷却几十分钟自愈）。
+  分钟线 jsonp 直连 + 日线因子当日缓存，每股 1 次请求。
+  HSSR 注解默认走 sina（串行 1.5s/股防限流）；`--source auto` 保留（tdx 失败后 sina 兜底）。
+- **qmt（已接入，暂不可用）**：国金 QMT（xtquant，已复制进 .venv），代码在
+  `_fetch_60m_qmt`/`_fetch_30m_qmt`，原生前复权、bar 时间即收盘时刻无需映射。
+  依赖本机 miniQMT 登录运行；miniQMT 权限 2026-09 被收回——背景是 9/11 两协会
+  《证券公司交易信息系统接入管理规范（试行）》行业性收紧，国金 7/6 起新开 QMT
+  权限默认就不含 miniQMT，存量也可能停用，恢复希望小，代码保留备查。
 - **gm**：掘金，须 .venv-gm 且终端运行；免费版 60m 历史有配额（报 status 1014），只作兜底。
-  HSSR 预计算需要的 800 根 60m 深历史走 tdx（`fetch_60m(code, count=800)`，
-  gm 配额坑不可用于此，注解步骤绝不放 gm 脚本）。
+  gm `history` 只返回已完结 bar，盘中当根 bar 要等收盘后才可见（作盘中通道有天然延迟）。
+  HSSR 预计算需要的 800 根 60m 深历史走 sina（gm 配额坑不可用于此，注解步骤绝不放 gm 脚本）。
 - **em（东财）**：push2his K 线接口被本机网络 WAF 按 TLS 指纹封锁，不可用。
+- **腾讯（评估后弃用 2026-09-14）**：分钟 K 线 mkline 已 301 重定向到 web3.ifzq.gtimg.cn，
+  而 web3 域名被本机网络连接级中止（WinError 10053）；fqkline 分钟级（m30/m60）已下线
+  （一律 bad params），仅日线 qfq 可用（可作未来日线备选源）。
+  评估对象 a-stock-data（SKILL.md 项目）分钟线全部依赖 mootdx/腾讯，对本机均无帮助。
+- **akshare（已盘点 2026-09-14，无新通道）**：它只是公开源的封装。60m 前复权仅两条路——
+  sina（已在用且项目直连优化更优）和 em（被封）；腾讯 tx 仅日线。升级 akshare 无意义。
+- **tushare（已放弃 2026-09-14）**：积分制付费，60m 分钟线需约 5000 积分，用户不走付费路线。
+- **tdxq（官方通达信客户端 TQ 接口，验证中）**：D:\tdx\PYPlugins\user\tqcenter.py，
+  走已登录客户端会话，绕开公共服务器封锁；2026-09-14 实测快照/日线正常，分钟线待
+  盘后数据下载（客户端内勾 5 分钟线）后复测。探针：`_probe_kimi.py`。
+- **stockdb（free-stockdb，已评估 2026-09-14）**：本地数据引擎（D:\stockdb\stockdb，
+  stockdb.exe 监听 127.0.0.1:7899，HTTP 返回 msgpack），已同步 23G 全市场数据
+  （1m 分钟线 2026-01 起 + 日线 + 复权因子表）。**只适合夜间批量**（HSSR 注解/建池备选）：
+  分钟线为原始不复权价（复权因子在「复权」表，需自乘 mult），且**盘中不更新**、
+  盘后约 15:30 可同步到当日数据（9-14 已验证：242 根 1m + 日 K 入库，1m→60m 聚合
+  与 sina 对数一致，个别 bar 高低价差 1 分钱），可作夜间 HSSR 注解加速源，不能作盘中扫描通道。
+  文档站宣称的 get_last_tick 秒级实时是作者在线 API 侧能力，本地引擎无此接口。
+  注意：同步（updater.exe）与查询服务（stockdb.exe）不能同时跑（leveldb 单写锁），
+  且同步不能被强杀（会损坏 leveldb，需清库重同步）。
 
-`run_scan.py` 是盘中扫描调度器：优先扫持仓（下穿+上穿）和深水池，再扫右/左/T0/T1/观察池，通道失败率 >50% 自动降级。
+`run_scan.py` 是盘中扫描调度器：依次扫持仓（下穿+上穿）→ 深水池 → 观察池，通道失败率 >50% 自动降级。
+2026-09-14 起为降 sina 限流风险，右侧/左侧/T0/T1 池盘中扫描暂停（POOLS 注释里可一键恢复），建池不受影响。
 参数：`--holdings` 只扫持仓两项（每 15 分钟任务用）；`--live` 盘中未完结 bar 参与判定（中段任务用）；无参数 = 全量完结确认。
-`fisher_scanner.py --source tdx|sina|gm|em` 可手动指定通道，`--live` 可手动跑盘中信号。
+`fisher_scanner.py --source sina|qmt|tdx|gm|em` 可手动指定通道，`--live` 可手动跑盘中信号。
 
 ## 踩过的坑（改代码前必读）
 
@@ -147,6 +172,16 @@
     深水池（38 只）覆盖完整池（127 只），随后 HSSR 注解按 38 只写回。build_pool.cmd
     已加 `.build_lock` 目录互斥锁（第二个实例直接退出），**手动补跑前确认没有别的
     建池在跑**；异常中断残留 .build_lock 时手动 `rmdir .build_lock`。
+12. **大QMT 内置 Python 环境**（weekend test/ 实测 2026-09-12）：pandas 不可用
+    （缺 unicodedata），取数用 `ContextInfo.get_history_data(n, period, field, code)`
+    返回原生 dict；订阅用 `set_universe`（无 subscribe_code）；源文件必须 UTF-8
+    （不支持 GBK）；回测必须显式设起止日期（默认只跑 1 根 bar）；回测吃本地数据，
+    需先在客户端「补充数据」；FileIO 可用（信号文件通道可行）。miniQMT 登录报
+    "client disconnected" = 权限不含 miniQMT（国金 7/6 起新开默认不含）。
+13. **两套费雪实现曾口径不一**（2026-09-14 对数统一）：扫描器 `fisher_transform`
+    是 Pine/同花顺口径（hl2 中价输入、窗口 9、v 超 ±0.99 截到 ±0.999）；
+    weekend test v1/v2 是 high 输入、窗口 10、±0.999 对称截断。以扫描器为准，
+    QMT 侧统一版为 `weekend test/fisher_test_daily_v3.py`。
 
 ## 常用操作
 
