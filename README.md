@@ -12,12 +12,12 @@
   「盘后数据下载（勾 5 分钟线）」。整池批量预取 + 本地缓存（cache/tdxq/），全池扫描秒级。
 - `"sina"`（新浪，次备）：前复权准确；分钟线接口会限流（HTTP 456），冷却几十分钟自愈；
   已做分钟线直连+因子当日缓存优化（每股 1 次请求）。
-- `"gm"`（掘金）：须 .venv-gm 环境且终端运行；免费版 60 分钟历史有配额，仅作兜底。
+- ~~gm~~（掘金，已删 2026-09-14）：建池已切 tdxq、扫描兜底已删，整体退役。
 - `"em"`（东方财富）：K线接口被本机网络 WAF 封锁，本机不可用。
 - ~~tdx~~（通达信公开服务器，已删 2026-09-14）：服务端整体拒数，git 历史可查。
 - ~~qmt~~（国金 miniQMT，已删 2026-09-14）：权限被收回，git 历史可查。
 
-盘中调度器 `run_scan.py` 按 **tdxq → sina → gm** 顺序自动降级（失败率 >50% 即切换）。
+盘中调度器 `run_scan.py` 按 **tdxq → sina** 顺序自动降级（失败率 >50% 即切换）。
 
 ## 信号定义
 
@@ -34,14 +34,14 @@ A 股 60 分钟 bar 一天 4 根，东财时间戳为 bar **结束**时刻：10:
 ```
 fisher_60min_scanner/
 ├── fisher_scanner.py    # 主程序（配置区在文件头部，参数可调）
-├── build_pool_gm.py     # 五池生成器（掘金 gm 版，当前默认；跑在 .venv-gm）
+├── build_pool_tdxq.py   # 五池生成器（通达信客户端 TQ 版，当前默认；跑在主环境 .venv，须客户端登录）
 ├── build_pool_dual.py   # 三池生成器（新浪版，备用）
 ├── scan_all.cmd         # 定时任务入口：深水+观察+持仓（2026-09-14 起精简，降 sina 限流风险），完结确认（bar 收盘后）
 ├── scan_mid.cmd         # bar 中段扫描入口（--live，盘中信号）
 ├── scan_holdings.cmd    # 持仓每 15 分钟监控入口（--holdings --live）
 ├── scan_daily.cmd       # 深水池日共振收盘复核入口（--daily-confirm，15:10）
 ├── scan_hssr.cmd        # HSSR 周报入口（--hssr-report，每周日 20:00）
-├── build_pool.cmd       # 建池任务入口（.build_lock 互斥锁 + gm 建五池 + .venv 深水池 HSSR 注解）
+├── build_pool.cmd       # 建池任务入口（.build_lock 互斥锁 + tdxq 建五池 + .venv 深水池 HSSR 注解）
 ├── run_hidden.vbs       # 隐藏控制台启动器（计划任务经它调用 .cmd，不弹窗）
 ├── holdings.csv         # 持仓清单（--buy 登记，下穿监控对象）
 ├── AGENTS.md            # AI 助手交接文档
@@ -53,7 +53,7 @@ fisher_60min_scanner/
 
 ## 每日工作流（推荐）
 
-全自动：Windows 计划任务工作日 00:00 建池（gm 版）；盘中每根 60 分钟 bar 的中段
+全自动：Windows 计划任务工作日 00:00 建池（tdxq 版，须通达信客户端登录在线）；盘中每根 60 分钟 bar 的中段
 （10:01/11:01/13:31/14:31，四根 bar 的中点）扫盘中信号（未完结 bar）、收盘后（10:31/11:31/14:01/15:01）
 扫完结确认，全部池 + 持仓并推送企业微信；持仓另加每 15 分钟（9:31 起）高频监控
 （见下文「正式运行」）。
@@ -61,8 +61,8 @@ fisher_60min_scanner/
 手动命令：
 
 ```bash
-# 建池（掘金 gm 版，约 1 分钟；需掘金终端运行并登录）
-.venv-gm\Scripts\python.exe build_pool_gm.py
+# 建池（tdxq 通达信客户端版，全量约 1 分钟；须通达信客户端 TdxW.exe 登录在线）
+.venv\Scripts\python.exe build_pool_tdxq.py
 
 # 深水池 HSSR 注解（主环境 .venv，默认 sina 串行防限流约 4 分钟；build_pool.cmd 已含此步）
 .venv\Scripts\python.exe fisher_scanner.py --annotate-hssr
@@ -74,20 +74,15 @@ fisher_60min_scanner/
 
 ### 方案一：右侧 / 左侧 / 深水 / T0 / T1 五池构建（两个数据源任选）
 
-五个池一次构建（T0/T1 ETF 池仅 gm 版支持），输出文件名固定
+五个池一次构建，输出文件名固定
 （`pool_right.csv` / `pool_left.csv` / `pool_deep.csv` / `pool_t0.csv` / `pool_t1.csv`），扫描器无需任何改动。
 
-**方案 A：掘金 gm（推荐，需安装掘金终端并登录）**
+**方案 A：tdxq 通达信客户端（推荐，须通达信客户端登录在线）**
 
 ```bash
-python -m venv .venv-gm                                    # 首次：独立环境（gm 依赖老版 pandas）
-.venv-gm\Scripts\python.exe -m pip install gm
-# 在掘金终端生成 token，写入 gm_token.key（一行，已 gitignore）
-.venv-gm\Scripts\python.exe build_pool_gm.py               # 全量约 2 分钟，走本地终端，无新浪限流
-.venv-gm\Scripts\python.exe build_pool_gm.py --resume      # 断点续跑
+# 通达信客户端（TdxW.exe）保持登录；客户端内做过一次「盘后数据下载」
+.venv\Scripts\python.exe build_pool_tdxq.py              # 全量约 1 分钟
 ```
-
-优点：自带剔 ST/停牌、按上市日期精确过滤满 1 年、真实成交额、前复权日线、极快。
 
 **方案 B：新浪（无需注册任何账号，开箱即用）**
 
@@ -138,13 +133,13 @@ pip install -r requirements.txt
 | D 周线共振 | 15% | 周线 Fisher < -2 → +2；周线 Fisher >1 且拐头向下 → -2（周一最糙周四五最准） |
 | E 极端度归一化 | 10% | 当前 Fisher 在自身历史分布 <5% 分位 → +2；<15% → +1 |
 
-总分 = Σ权重×分项，范围 -2~+2，仅 gm 版建池支持。
+总分 = Σ权重×分项，范围 -2~+2，tdxq 版建池支持。
 
 **深水池 HSSR 预计算**（`pool_deep.csv` 的 hssr/hssr_n 两列）：建池后由主环境 .venv
 注解步骤（`build_pool.cmd` 第二步，或手动 `fisher_scanner.py --annotate-hssr`）
 对每只股票回测历史 60m 完结 bar 上穿信号——信号出现后 10 根 bar close 上涨记成功，
 取最近 20 次可评估信号（最后 10 根 bar 内的信号不可评估，剔除），样本 < 5 留空。
-深历史走 sina；gm 60m 批量拉取有配额限制，不可用于此。
+深历史走 sina。
 深水推送按档位附仓位建议：≥75% 正常仓位；50–75% 仓位减半；<50% 不建议买入；
 样本不足标注「HSSR 样本不足 (n<5)」。
 
@@ -231,7 +226,7 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 
 | 任务名 | 触发 | 动作 |
 |---|---|---|
-| `fisher_建池` | 工作日 00:00 | `build_pool.cmd`（gm 重建五池 + .venv 深水池 HSSR 注解，需掘金终端运行） |
+| `fisher_建池` | 工作日 00:00 | `build_pool.cmd`（tdxq 重建五池 + .venv 深水池 HSSR 注解，需通达信客户端登录在线） |
 | `fisher_持仓` | 每天 9:31–15:20 每 15 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
 | `fisher_扫描1001` / `1101` / `1331` / `1431` | 工作日对应时刻 | `scan_mid.cmd`：深水+观察+持仓，**盘中信号**（未完结 bar） |
 | `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：深水+观察+持仓，**完结确认**（bar 收盘后） |

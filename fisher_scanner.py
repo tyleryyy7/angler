@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 # ----------------------- 配置区（按需修改） -----------------------
-DATA_SOURCE = "tdxq"      # 数据源："tdxq"（默认，通达信客户端 TQ，须客户端登录）/ "sina" / "gm"（须 .venv-gm）/ "em"（本机被封）
+DATA_SOURCE = "tdxq"      # 数据源："tdxq"（默认，通达信客户端 TQ，须客户端登录）/ "sina" / "em"（本机被封）
 FISHER_LEN = 9            # Fisher 窗口长度，与 Pine/同花顺参数一致
 MIN_BARS = 80             # 60分钟bar少于此数视为暖机不足，跳过（次新股、长期停牌）
 REQUEST_INTERVAL = 0.25   # 每个 worker 每只股票之间的请求间隔（秒），防限流
@@ -150,52 +150,6 @@ def signal_bar_index(df, now=None, live=False):
 def _sina_symbol(code):
     """新浪代码前缀：6/5(股票/沪ETF 51/58) -> sh，其余（00/30/68/15/16）-> sz。"""
     return ("sh" if code.startswith(("5", "6")) else "sz") + code
-
-
-def _gm_symbol(code):
-    """gm 代码格式：沪 6/5 开头 -> SHSE.xxxxxx，其余 -> SZSE.xxxxxx。"""
-    return ("SHSE." if code.startswith(("5", "6")) else "SZSE.") + code
-
-
-_gm_ready = False
-
-
-def _fetch_60m_gm(code):
-    """掘金 60 分钟前复权 K 线。注意 gm 的 frequency='3600s' 才是 60 分钟（'60s' 是 1 分钟）。"""
-    global _gm_ready
-    from gm.api import history, ADJUST_PREV, set_token
-    if not _gm_ready:
-        token_file = Path(__file__).resolve().parent / "gm_token.key"
-        set_token(token_file.read_text(encoding="utf-8").strip())
-        _gm_ready = True
-    end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    start = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
-    df = history(symbol=_gm_symbol(code), frequency="3600s",
-                 start_time=start, end_time=end, adjust=ADJUST_PREV, df=True)
-    if df is None or len(df) == 0:
-        return None
-    df = df.rename(columns={"eob": "时间", "high": "最高", "low": "最低", "close": "收盘"})
-    df["时间"] = pd.to_datetime(df["时间"]).dt.tz_localize(None)  # 去时区 11，便于和本地时间比较
-    return df
-
-
-def _fetch_30m_gm(code):
-    """掘金 30 分钟前复权 K 线（frequency='1800s'）。须 .venv-gm 环境。"""
-    global _gm_ready
-    from gm.api import history, ADJUST_PREV, set_token
-    if not _gm_ready:
-        token_file = Path(__file__).resolve().parent / "gm_token.key"
-        set_token(token_file.read_text(encoding="utf-8").strip())
-        _gm_ready = True
-    end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    start = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
-    df = history(symbol=_gm_symbol(code), frequency="1800s",
-                 start_time=start, end_time=end, adjust=ADJUST_PREV, df=True)
-    if df is None or len(df) == 0:
-        return None
-    df = df.rename(columns={"eob": "时间", "high": "最高", "low": "最低", "close": "收盘"})
-    df["时间"] = pd.to_datetime(df["时间"]).dt.tz_localize(None)
-    return df
 
 
 def _daily_qfq_factor(code):
@@ -325,17 +279,13 @@ def _fetch_30m_tdxq(code):
 def fetch_60m(code, source=None, count=None):
     """拉取单只股票的 60 分钟前复权 K 线，带重试。失败返回 None。
 
-    source: "tdxq"（默认，通达信客户端 TQ，须客户端登录，整池预取+本地缓存）/ "sina" / "gm"（须在 .venv-gm 运行）/ "em"（东财）。
+    source: "tdxq"（默认，通达信客户端 TQ，须客户端登录，整池预取+本地缓存）/ "sina" / "em"（东财）。
     count: 仅 tdxq 源生效（单次上限 800），None 时用各源默认深度。
     """
     source = source or DATA_SOURCE
     for k in range(RETRY):
         try:
-            if source == "gm":
-                df = _fetch_60m_gm(code)
-                if df is not None and len(df) > 0:
-                    return df
-            elif source == "tdxq":
+            if source == "tdxq":
                 df = _fetch_60m_tdxq(code, count or 800)
                 if df is not None and len(df) > 0:
                     return df
@@ -360,11 +310,7 @@ def fetch_30m(code, source=None):
     source = source or DATA_SOURCE
     for k in range(RETRY):
         try:
-            if source == "gm":
-                df = _fetch_30m_gm(code)
-                if df is not None and len(df) > 0:
-                    return df
-            elif source == "tdxq":
+            if source == "tdxq":
                 df = _fetch_30m_tdxq(code)
                 if df is not None and len(df) > 0:
                     return df
@@ -988,7 +934,7 @@ def hssr_report(now=None):
 # 价格版口径：历史完结 60m bar 上穿信号（just_crossed_up，无 ESI 过滤）出现后
 # N_HOLD 根 bar close 上涨记成功；取最近 N_SIGNALS 次可评估信号（最后 N_HOLD 根
 # 内的信号尚无足够后续 bar，剔除）；样本 < 5 记样本不足。
-# 深历史走 sina（tdx 公开服务器 2026-09-14 起拒数，通道已删）；gm 60m 批量拉取有配额坑（status 1014），不可用于此。
+# 深历史走 sina（tdx 公开服务器 2026-09-14 起拒数，通道已删）。
 HSSR_N_HOLD = 10        # 成功判定持有窗口（60m bar 数）
 HSSR_N_SIGNALS = 20     # 统计窗口：最近 N 次可评估信号
 HSSR_MIN_SAMPLE = 5     # 可评估样本少于此数视为样本不足（hssr 留空）
@@ -1381,8 +1327,8 @@ def main():
     parser.add_argument("--limit", type=int, help="只扫描前 N 只（调试）")
     parser.add_argument("--side", choices=["up", "down"], default="up",
                         help="up=上穿（默认，选股），down=下穿（持仓监控）")
-    parser.add_argument("--source", choices=["sina", "gm", "em", "tdxq", "auto"], default=None,
-                        help="数据源（缺省用配置区 DATA_SOURCE）；gm 须在 .venv-gm 环境运行；"
+    parser.add_argument("--source", choices=["sina", "em", "tdxq", "auto"], default=None,
+                        help="数据源（缺省用配置区 DATA_SOURCE）；"
                              "auto 仅用于 --annotate-hssr（等价 sina，历史兼容）")
     parser.add_argument("--buy", metavar="CODE", help="登记买入到 holdings.csv 后退出")
     parser.add_argument("--price", type=float, help="买入价（配合 --buy，缺省取最新价）")

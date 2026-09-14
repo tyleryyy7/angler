@@ -6,11 +6,10 @@
     持仓（下穿/上穿）→ pool_deep → watchlist
     （右侧/左侧/T0/T1 池盘中扫描已暂停，恢复方法见 POOLS 注释；建池不受影响）
 
-通道切换逻辑（降级链 tdxq → sina → gm，2026-09-14 起）：
+通道切换逻辑（降级链 tdxq → sina，2026-09-14 起，gm 兜底已退役）：
     1. 先用 tdxq（通达信客户端 TQ 接口，进程内，整池预取+本地缓存）——须客户端登录运行；
     2. 失败率 > 50% 判定通道失效（如客户端未开），换新浪进程内重扫；
-    3. 仍失败 → gm 子进程（.venv-gm）兜底（该进程自行推送）；
-    4. 三者全挂 → 推送「三通道均不可用」告警。
+    3. 两者全挂 → 推送「两通道均不可用」告警。
 
 用法：
     .venv\\Scripts\\python.exe run_scan.py              # 全量扫描，只判完结 bar（收盘后任务）
@@ -21,7 +20,6 @@
 
 import argparse
 import logging
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -32,10 +30,9 @@ import pandas as pd
 import fisher_scanner as fs
 
 BASE = Path(__file__).resolve().parent
-GM_PYTHON = BASE / ".venv-gm" / "Scripts" / "python.exe"
 FAIL_RATE_LIMIT = 0.5         # 失败率超过此值判定通道失效
-CHANNELS = ("tdxq", "sina")  # 进程内通道降级链；gm 始终作为最后兜底（子进程）
-                             # 2026-09-14 起 tdxq（通达信客户端 TQ 接口，须客户端登录）作主力
+CHANNELS = ("tdxq", "sina")  # 进程内通道降级链，2026-09-14 起（gm 兜底已退役）
+                             # tdxq（通达信客户端 TQ 接口，须客户端登录）作主力，sina 次备
 POOLS = [("holdings.csv", "down"),        # 持仓下穿：卖出预警（最优先）
          ("holdings.csv", "up"),           # 持仓上穿：回钩/加仓提示
          ("pool_deep.csv", "up"),          # 深水池优先（用户指定）
@@ -51,23 +48,8 @@ logging.basicConfig(level=logging.INFO,
                               logging.StreamHandler(sys.stdout)])
 
 
-def run_gm_scan(pool_file, side, live=False):
-    """用 .venv-gm 子进程跑 gm 通道扫描（该进程自行推送）。返回进程退出码。"""
-    cmd = [str(GM_PYTHON), str(BASE / "fisher_scanner.py"), "--once",
-           "--pool-file", pool_file, "--source", "gm"]
-    if side == "down":
-        cmd += ["--side", "down"]
-    if live:
-        cmd += ["--live"]
-    r = subprocess.run(cmd, cwd=str(BASE), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    if r.returncode != 0:
-        logging.warning("gm 通道子进程异常退出(%d): %s", r.returncode, (r.stderr or "")[-300:])
-    return r.returncode
-
-
 def push_alert(text):
-    """直接推送一条文本告警（双通道都失效时用）。"""
+    """直接推送一条文本告警（两通道都失效时用）。"""
     logging.warning(text)
     if fs.WECOM_WEBHOOK:
         try:
@@ -79,8 +61,7 @@ def push_alert(text):
 
 
 def scan_with_failover(pool, pool_file, pond, tag, side, live=False):
-    """降级链：tdxq（进程内）→ sina（进程内）→ gm（.venv-gm 子进程）。tdx 已失效（2026-09-14）。
-    返回进程内扫描结果 DataFrame；走 gm 子进程兜底时返回 None（该进程自行推送）。"""
+    """降级链：tdxq（进程内）→ sina（进程内）；均不可用则推送告警。"""
     for source in CHANNELS:
         result = fs.scan(pool, label=tag, side=side, source=source, live=live)
         total = result.attrs.get("total", 0)
@@ -90,9 +71,7 @@ def scan_with_failover(pool, pool_file, pond, tag, side, live=False):
             return result
         logging.warning("%s 通道失败率 %.0f%%（%d/%d），切换下一通道: %s",
                         source, fails / total * 100, fails, total, pool_file)
-    # gm 兜底（跨环境子进程，自行推送）
-    if run_gm_scan(pool_file, side, live=live) != 0:
-        push_alert("**%s：三通道均不可用（tdxq/sina/gm），本次扫描缺失**" % pond)
+    push_alert("**%s：tdxq/sina 两通道均不可用，本次扫描缺失**" % pond)
     return None
 
 

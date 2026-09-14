@@ -10,39 +10,40 @@
 ## 文件结构
 
 - `fisher_scanner.py` — 主扫描器（主环境 `.venv` 运行）。信号定义、上穿/下穿判定、
-  并发扫描、企业微信推送、多数据源（tdxq/sina/gm；em 本机被封）。配置区在文件头部。
-- `run_scan.py` — 盘中扫描调度器（`.venv` 运行）：依次扫五池+持仓下穿，通道降级切换。
-- `build_pool_gm.py` — 建池（掘金 gm 版，**当前默认**，`.venv-gm` 运行）。
-  产出 pool_right.csv / pool_left.csv / pool_deep.csv / pool_t0.csv / pool_t1.csv。
+  并发扫描、企业微信推送、多数据源（tdxq/sina；em 本机被封）。配置区在文件头部。
+- `run_scan.py` — 盘中扫描调度器（`.venv` 运行）：扫持仓/深水/观察池，通道降级切换。
+- `build_pool_tdxq.py` — 建池（通达信客户端 TQ 版，**当前默认**，主环境 `.venv` 运行，
+  须客户端登录在线）。产出 pool_right.csv / pool_left.csv / pool_deep.csv / pool_t0.csv / pool_t1.csv。
+  全市场名单走 tdxq --universe；股票名称/ST 过滤用新浪快照；ETF 名称用 TQ get_stock_info，
+  T+0/T+1 用名称关键词分类（TQ 无 trade_n 字段）。
 - `build_pool_dual.py` — 建池（新浪版，**备用**，主环境 `.venv` 运行）。
-  gm 不可用时切回，输出文件名相同。
+  tdxq 不可用时切回，输出文件名相同。
+- `build_pool_gm.py` — 已删除（掘金 gm 版，2026-09-14 随 gm 通道退役，git 历史可查）。
 - `build_pool.py` — 已删除（旧单池方案，git 历史可查）。
 - `scan_all.cmd` — 盘中扫描入口（收盘完结确认，无参数，CRLF 换行，勿改 LF）。
 - `scan_mid.cmd` — bar 中段扫描入口：`run_scan.py --live`（未完结 bar 也判定，CRLF）。
 - `scan_holdings.cmd` — 持仓每 15 分钟监控入口：`run_scan.py --holdings --live`（CRLF）。
 - `scan_daily.cmd` — 深水池日共振收盘复核入口：`run_scan.py --daily-confirm`（CRLF）。
 - `scan_hssr.cmd` — HSSR 周报入口：`run_scan.py --hssr-report`（CRLF）。
-- `build_pool.cmd` — 建池任务入口（CRLF）：`.build_lock` 互斥锁 + gm 建五池 + `.venv` 深水池 HSSR 注解。
+- `build_pool.cmd` — 建池任务入口（CRLF）：`.build_lock` 互斥锁 + tdxq 建五池 + `.venv` 深水池 HSSR 注解。
 - `run_hidden.vbs` — 隐藏控制台启动器，所有计划任务经它调用 .cmd（防弹窗）。
 - `holdings.csv` — 用户持仓（code,name,buy_date,buy_price），gitignore。
 - `watchlist.csv` — 观察池（清仓/放过但继续盯上穿回钩的票），gitignore。
   --buy 登记持仓、--sell 清仓入观察池、--watch 手动加观察池、--unwatch 移出观察池；
   持仓双向监控（上穿回钩+下穿预警）。
-- `webhook.key` / `gm_token.key` — 密钥文件，gitignore，**绝不提交**。
+- `webhook.key` — 密钥文件，gitignore，**绝不提交**（gm_token.key 已随 gm 退役废弃）。
 - `cache/esi_ledger.csv` — Fisher-ESI 进出场台账（code,entry_time,entry_fisher60,
   fail_time,fail_fisher30,failed,bars_held,status；status: open/closed），cache/ 整体已 gitignore。
-- `results/`、`scanner.log`、`dual_progress.txt`、`gm_progress.txt` — 运行产物，gitignore。
+- `results/`、`scanner.log`、`dual_progress.txt`、`tdxq_progress.txt` — 运行产物，gitignore。
 - `weekend test/` — 大QMT 内置策略测试资产（2026-09-12 周末完成，已纳入 git）：
   成果总结 md + fisher_test_daily_v2.py（纯信号日线版，prev off-by-one 已修复）+
   fisher_trade_test_v1.py（含下单版，零轴离场为占位规则）。架构方向：外部系统出信号
   → 信号文件（FileIO 已验证可用）→ 大QMT 内置执行器下单（半自动）。
 
-## 两个 Python 环境（重要，不要混用）
+## Python 环境
 
-- `.venv`（主环境）：akshare + pandas 3.x，跑 fisher_scanner.py / build_pool_dual.py。
-- `.venv-gm`：gm SDK 强制 pandas 1.5 / numpy 1.26，与 akshare 冲突，
-  所以 gm 相关脚本只能跑在 `.venv-gm\Scripts\python.exe`。
-  **绝不要在主环境 pip install gm**（会降级 pandas 搞坏 akshare）。
+- `.venv`（唯一环境）：akshare + pandas 3.x，跑 fisher_scanner.py / build_pool_tdxq.py /
+  build_pool_dual.py / run_scan.py。gm 双环境时代（.venv-gm）已于 2026-09-14 结束。
 
 ## 策略定义（当前版本）
 
@@ -84,8 +85,8 @@
 
 ## 计划任务（Windows schtasks）
 
-- `fisher_建池` 00:00 周一~周五 → build_pool.cmd（gm 建五池 + .venv HSSR 注解两步，
-  **需掘金终端运行并登录**）
+- `fisher_建池` 00:00 周一~周五 → build_pool.cmd（tdxq 建五池 + HSSR 注解两步，
+  **需通达信客户端（TdxW.exe）运行并登录**）
 - `fisher_持仓` 每天 9:31–15:20 每 15 分钟 → scan_holdings.cmd
   （daily 任务，周末由 run_scan.py 内的 weekday 保护直接退出；节假日空跑但不会重复推送，去重兜底）
 - `fisher_扫描1001/1101/1331/1431` 周一~周五 → scan_mid.cmd（bar 中段，--live 盘中信号）
@@ -96,10 +97,10 @@
 - 任务经 run_hidden.vbs 隐藏运行。
 - 所有 fisher 任务已开启「错过计划启动后尽快补跑」（StartWhenAvailable）：
   电脑睡眠/关机错过触发点时，唤醒后会自动补跑一次（2026-08-26 起）。
-- `build_pool_gm.py` 盘中（15:30 前）运行时自动剔除当日未完结日 K，避免半成品 bar 污染指标。
+- `build_pool_tdxq.py` 盘中（15:30 前）运行时自动剔除当日未完结日 K，避免半成品 bar 污染指标。
 - 重建命令见 使用说明.md。查询：`schtasks /query | findstr fisher`
 
-## 数据通道（降级链：tdxq → sina → gm；2026-09-14 起）
+## 数据通道（降级链：tdxq → sina；2026-09-14 起）
 
 - **tdxq（默认主力）**：官方通达信客户端 TQ 接口（D:\tdx\PYPlugins\user\tqcenter.py），
   走已登录客户端（TdxW.exe）会话，绕开公共服务器封锁，原生前复权、无限流、
@@ -112,14 +113,13 @@
 - **tdx（已删除 2026-09-14，git 历史可查）**：通达信公开服务器对本机整体拒数
   （握手正常但 K 线/报价全返回空，xmtdx/pytdx 双实现交叉验证为服务端行为），
   恢复无望，代码与 xmtdx/pytdx 库已删。
-- **sina（默认）**：akshare，前复权准，但会限流（HTTP 456，冷却几十分钟自愈）。
+- **sina（次备）**：akshare，前复权准，但会限流（HTTP 456，冷却几十分钟自愈）。
   分钟线 jsonp 直连 + 日线因子当日缓存，每股 1 次请求。
   HSSR 注解默认走 sina（串行 1.5s/股防限流）。
 - **qmt（已删除 2026-09-14，git 历史可查）**：国金 QMT miniQMT 通道。miniQMT 权限被收回
   （9/11 两协会新规行业性收紧，国金 7/6 起新开默认不含），恢复无望，代码与 xtquant 包已删。
-- **gm**：掘金，须 .venv-gm 且终端运行；免费版 60m 历史有配额（报 status 1014），只作兜底。
-  gm `history` 只返回已完结 bar，盘中当根 bar 要等收盘后才可见（作盘中通道有天然延迟）。
-  HSSR 预计算需要的 800 根 60m 深历史走 sina（gm 配额坑不可用于此，注解步骤绝不放 gm 脚本）。
+- **gm（已删除 2026-09-14，git 历史可查）**：掘金通道整体退役（建池已切 tdxq、
+  扫描兜底已删），.venv-gm / build_pool_gm.py / gm 取数代码均已删。
 - **em（东财）**：push2his K 线接口被本机网络 WAF 按 TLS 指纹封锁，不可用。
 - **腾讯（评估后弃用 2026-09-14）**：分钟 K 线 mkline 已 301 重定向到 web3.ifzq.gtimg.cn，
   而 web3 域名被本机网络连接级中止（WinError 10053）；fqkline 分钟级（m30/m60）已下线
@@ -135,7 +135,7 @@
 `run_scan.py` 是盘中扫描调度器：依次扫持仓（下穿+上穿）→ 深水池 → 观察池，通道失败率 >50% 自动降级。
 2026-09-14 起为降 sina 限流风险，右侧/左侧/T0/T1 池盘中扫描暂停（POOLS 注释里可一键恢复），建池不受影响。
 参数：`--holdings` 只扫持仓两项（每 15 分钟任务用）；`--live` 盘中未完结 bar 参与判定（中段任务用）；无参数 = 全量完结确认。
-`fisher_scanner.py --source tdxq|sina|gm|em` 可手动指定通道，`--live` 可手动跑盘中信号。
+`fisher_scanner.py --source tdxq|sina|em` 可手动指定通道，`--live` 可手动跑盘中信号。
 
 ## 踩过的坑（改代码前必读）
 
@@ -157,23 +157,20 @@
    push2his（K线，扫描器依赖）仍按 TLS 指纹封锁，暂不能切回 em。
 8. Git Bash 里调 cmd/schtasks 等 Windows 命令要先 `export MSYS2_ARG_CONV_EXCL='*'`，
    否则 /c 等参数会被路径转换吃掉。
-9. gm 免费版 quota：日线历史随便拉，但 60 分钟线大批量拉取会报
-   `{"status": 1014, "message": "历史行情服务调用错误"}`，所以 gm 不作扫描主通道。
-10. gm `get_symbols(skip_st=True)` 的 is_st 标志不完整（实测 ST龙津/ST洲际 漏剔），
-    建池必须叠加名称过滤 `~sec_name.str.contains("ST|退")`。
-11. **建池并发写坏池文件**（2026-09-09 实发）：fisher_建池 的 StartWhenAvailable 补跑
+9. ~~gm quota/is_st 坑~~（gm 已退役 2026-09-14，坑记录随代码删除，git 历史可查）。
+10. **建池并发写坏池文件**（2026-09-09 实发，gm 时代）：fisher_建池 的 StartWhenAvailable 补跑
     与手动 build_pool.cmd 同时运行，两轮 gm 建池交错，增量 save_results 用未完成的
     深水池（38 只）覆盖完整池（127 只），随后 HSSR 注解按 38 只写回。build_pool.cmd
     已加 `.build_lock` 目录互斥锁（第二个实例直接退出），**手动补跑前确认没有别的
     建池在跑**；异常中断残留 .build_lock 时手动 `rmdir .build_lock`。
-12. **大QMT 内置 Python 环境**（weekend test/ 实测 2026-09-12）：pandas 不可用
+11. **大QMT 内置 Python 环境**（weekend test/ 实测 2026-09-12）：pandas 不可用
     （缺 unicodedata），取数用 `ContextInfo.get_history_data(n, period, field, code)`
     返回原生 dict；订阅用 `set_universe`（无 subscribe_code）；源文件必须 UTF-8
     （不支持 GBK；且**路径/字符串里的中文也会炸**——内置环境按 GBK 读 UTF-8 源文件，
     中文路径直接 SyntaxError，一切文件路径用纯英文）；回测必须显式设起止日期（默认只跑 1 根 bar）；回测吃本地数据，
     需先在客户端「补充数据」；FileIO 可用（信号文件通道可行）。miniQMT 登录报
     "client disconnected" = 权限不含 miniQMT（国金 7/6 起新开默认不含）。
-13. **两套费雪实现曾口径不一**（2026-09-14 对数统一）：扫描器 `fisher_transform`
+12. **两套费雪实现曾口径不一**（2026-09-14 对数统一）：扫描器 `fisher_transform`
     是 Pine/同花顺口径（hl2 中价输入、窗口 9、v 超 ±0.99 截到 ±0.999）；
     weekend test v1/v2 是 high 输入、窗口 10、±0.999 对称截断。以扫描器为准，
     QMT 侧统一版为 `weekend test/fisher_test_daily_v3.py`。
@@ -185,7 +182,7 @@
 - 手动扫描：`.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv`
   （加 `--live` 判盘中未完结 bar）
 - 手动持仓监控：`.venv\Scripts\python.exe run_scan.py --holdings --live`
-- 手动建池：`.venv-gm\Scripts\python.exe build_pool_gm.py`
+- 手动建池：`.venv\Scripts\python.exe build_pool_tdxq.py`（须通达信客户端登录在线）
 - 单票体检：`.venv\Scripts\python.exe fisher_scanner.py --inspect 600498`（支持中文名，
   先查各池/持仓/观察池 CSV 反查、查不到用新浪快照反查；加 `--push` 推送报告到企业微信）
 - 推送渠道：企业微信机器人 webhook（webhook.key），notify() 已实现，按池文件名
@@ -194,5 +191,5 @@
 ## Git
 
 远程：git@github.com:tyleryyy7/angler.git（main 分支，SSH key 已配好）。
-提交前确认 git status 里没有 webhook.key / gm_token.key / holdings.csv / pool*.csv。
+提交前确认 git status 里没有 webhook.key / holdings.csv / pool*.csv。
 README.md 是 使用说明.md 的副本，改文档时两边同步。

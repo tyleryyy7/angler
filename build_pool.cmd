@@ -5,6 +5,6 @@ if errorlevel 1 (
     echo BUILD POOL already running, exit.
     exit /b 1
 )
-.venv-gm\Scripts\python.exe build_pool_gm.py
+.venv\Scripts\python.exe build_pool_tdxq.py
 .venv\Scripts\python.exe fisher_scanner.py --annotate-hssr
 rmdir .build_lock
