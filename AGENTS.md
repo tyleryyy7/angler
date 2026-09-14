@@ -100,7 +100,15 @@
 - `build_pool_gm.py` 盘中（15:30 前）运行时自动剔除当日未完结日 K，避免半成品 bar 污染指标。
 - 重建命令见 使用说明.md。查询：`schtasks /query | findstr fisher`
 
-## 数据通道（降级链：sina → gm；2026-09-14 起）
+## 数据通道（降级链：tdxq → sina → gm；2026-09-14 起）
+
+- **tdxq（默认主力）**：官方通达信客户端 TQ 接口（D:\tdx\PYPlugins\user\tqcenter.py），
+  走已登录客户端（TdxW.exe）会话，绕开公共服务器封锁，原生前复权、无限流、
+  bar 时间即收盘时刻无需映射。扫描时整池批量预取（`D:\tdx\PYPlugins\user\tdxq_fetch.py`
+  子进程，一次 TQ 会话）落盘 cache/tdxq/，scan_one 本地读 CSV；缓存过期（交易日 10:35 后
+  仍无当日 bar）自动单票补取，补取失败触发降级。**前提：客户端登录常开 + 客户端内做过
+  一次「盘后数据下载（勾 5 分钟线）」**（2026-09-14 复测通过；分钟历史深度取决于下载量，
+  当前约 280 根 1h，HSSR 800 根需求仍走 sina）。
 
 - **tdx（已失效 2026-09-14，勿用）**：通达信公开行情服务器对本机拒数——TCP 和握手正常，
   但 K 线请求一律返回空数据（xmtdx 报 `minute datetime: 数据不足`；pytdx 实测同批服务器
@@ -125,9 +133,7 @@
 - **akshare（已盘点 2026-09-14，无新通道）**：它只是公开源的封装。60m 前复权仅两条路——
   sina（已在用且项目直连优化更优）和 em（被封）；腾讯 tx 仅日线。升级 akshare 无意义。
 - **tushare（已放弃 2026-09-14）**：积分制付费，60m 分钟线需约 5000 积分，用户不走付费路线。
-- **tdxq（官方通达信客户端 TQ 接口，验证中）**：D:\tdx\PYPlugins\user\tqcenter.py，
-  走已登录客户端会话，绕开公共服务器封锁；2026-09-14 实测快照/日线正常，分钟线待
-  盘后数据下载（客户端内勾 5 分钟线）后复测。探针：`_probe_kimi.py`。
+- **tdxq（官方通达信客户端 TQ 接口）**：见上方主力条目。探针：`_probe_kimi.py`。
 - **stockdb（free-stockdb，已评估 2026-09-14）**：本地数据引擎（D:\stockdb\stockdb，
   stockdb.exe 监听 127.0.0.1:7899，HTTP 返回 msgpack），已同步 23G 全市场数据
   （1m 分钟线 2026-01 起 + 日线 + 复权因子表）。**只适合夜间批量**（HSSR 注解/建池备选）：
@@ -141,7 +147,7 @@
 `run_scan.py` 是盘中扫描调度器：依次扫持仓（下穿+上穿）→ 深水池 → 观察池，通道失败率 >50% 自动降级。
 2026-09-14 起为降 sina 限流风险，右侧/左侧/T0/T1 池盘中扫描暂停（POOLS 注释里可一键恢复），建池不受影响。
 参数：`--holdings` 只扫持仓两项（每 15 分钟任务用）；`--live` 盘中未完结 bar 参与判定（中段任务用）；无参数 = 全量完结确认。
-`fisher_scanner.py --source sina|qmt|tdx|gm|em` 可手动指定通道，`--live` 可手动跑盘中信号。
+`fisher_scanner.py --source tdxq|sina|qmt|tdx|gm|em` 可手动指定通道，`--live` 可手动跑盘中信号。
 
 ## 踩过的坑（改代码前必读）
 
@@ -175,7 +181,8 @@
 12. **大QMT 内置 Python 环境**（weekend test/ 实测 2026-09-12）：pandas 不可用
     （缺 unicodedata），取数用 `ContextInfo.get_history_data(n, period, field, code)`
     返回原生 dict；订阅用 `set_universe`（无 subscribe_code）；源文件必须 UTF-8
-    （不支持 GBK）；回测必须显式设起止日期（默认只跑 1 根 bar）；回测吃本地数据，
+    （不支持 GBK；且**路径/字符串里的中文也会炸**——内置环境按 GBK 读 UTF-8 源文件，
+    中文路径直接 SyntaxError，一切文件路径用纯英文）；回测必须显式设起止日期（默认只跑 1 根 bar）；回测吃本地数据，
     需先在客户端「补充数据」；FileIO 可用（信号文件通道可行）。miniQMT 登录报
     "client disconnected" = 权限不含 miniQMT（国金 7/6 起新开默认不含）。
 13. **两套费雪实现曾口径不一**（2026-09-14 对数统一）：扫描器 `fisher_transform`

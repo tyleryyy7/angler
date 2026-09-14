@@ -2,13 +2,13 @@
 """
 盘中扫描调度器（双通道互备，跑在主环境 .venv）
 
-每个时点由 .cmd 调用一次，默认依次处理 8 个扫描项：
-    持仓（下穿/上穿）→ pool_deep → pool_right/left/t0/t1（上穿）→ watchlist
-    （持仓和深水池按用户要求排在最前，优先出信号）
+每个时点由 .cmd 调用一次，默认依次处理扫描项（2026-09-14 起精简，降 sina 限流风险）：
+    持仓（下穿/上穿）→ pool_deep → watchlist
+    （右侧/左侧/T0/T1 池盘中扫描已暂停，恢复方法见 POOLS 注释；建池不受影响）
 
-通道切换逻辑（降级链 tdx → sina → gm）：
-    1. 先用通达信（xmtdx）在进程内扫描——最快、无限流；
-    2. 失败率 > 50% 判定通道失效，换新浪进程内重扫；
+通道切换逻辑（降级链 tdxq → sina → gm，2026-09-14 起）：
+    1. 先用 tdxq（通达信客户端 TQ 接口，进程内，整池预取+本地缓存）——须客户端登录运行；
+    2. 失败率 > 50% 判定通道失效（如客户端未开），换新浪进程内重扫；
     3. 仍失败 → gm 子进程（.venv-gm）兜底（该进程自行推送）；
     4. 三者全挂 → 推送「三通道均不可用」告警。
 
@@ -34,14 +34,16 @@ import fisher_scanner as fs
 BASE = Path(__file__).resolve().parent
 GM_PYTHON = BASE / ".venv-gm" / "Scripts" / "python.exe"
 FAIL_RATE_LIMIT = 0.5         # 失败率超过此值判定通道失效
-CHANNELS = ("tdx",)           # 进程内通道降级链；gm 始终作为最后兜底（子进程）
-                              # 新浪限流修养期：("tdx",)；恢复后改回 ("tdx", "sina")
+CHANNELS = ("tdxq", "sina")  # 进程内通道降级链；gm 始终作为最后兜底（子进程）
+                             # 2026-09-14 起 tdxq（通达信客户端 TQ 接口，须客户端登录）作主力
 POOLS = [("holdings.csv", "down"),        # 持仓下穿：卖出预警（最优先）
          ("holdings.csv", "up"),           # 持仓上穿：回钩/加仓提示
          ("pool_deep.csv", "up"),          # 深水池优先（用户指定）
-         ("pool_right.csv", "up"), ("pool_left.csv", "up"),
-         ("pool_t0.csv", "up"), ("pool_t1.csv", "up"),
          ("watchlist.csv", "up")]          # 观察池：盯 60 分钟上穿回钩
+# 2026-09-14 起为降低 sina 限流风险，暂停 右侧/左侧/T0/T1 池盘中扫描（建池不受影响）。
+# 恢复时把下面四行加回 POOLS：
+#         ("pool_right.csv", "up"), ("pool_left.csv", "up"),
+#         ("pool_t0.csv", "up"), ("pool_t1.csv", "up"),
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -77,7 +79,7 @@ def push_alert(text):
 
 
 def scan_with_failover(pool, pool_file, pond, tag, side, live=False):
-    """降级链：tdx（通达信，进程内）→ sina（进程内）→ gm（.venv-gm 子进程）。
+    """降级链：tdxq（进程内）→ sina（进程内）→ gm（.venv-gm 子进程）。tdx 已失效（2026-09-14）。
     返回进程内扫描结果 DataFrame；走 gm 子进程兜底时返回 None（该进程自行推送）。"""
     for source in CHANNELS:
         result = fs.scan(pool, label=tag, side=side, source=source, live=live)
@@ -90,7 +92,7 @@ def scan_with_failover(pool, pool_file, pond, tag, side, live=False):
                         source, fails / total * 100, fails, total, pool_file)
     # gm 兜底（跨环境子进程，自行推送）
     if run_gm_scan(pool_file, side, live=live) != 0:
-        push_alert("**%s：三通道均不可用（tdx/sina/gm），本次扫描缺失**" % pond)
+        push_alert("**%s：三通道均不可用（tdxq/sina/gm），本次扫描缺失**" % pond)
     return None
 
 

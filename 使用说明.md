@@ -7,13 +7,19 @@
 
 数据源由 `fisher_scanner.py` 配置区的 `DATA_SOURCE`（或 `--source` 参数）决定：
 
-- `"tdx"`（默认，通达信 xmtdx 库）：TCP 协议直连券商行情服务器，快、无限流、免注册；
-  原始数据不复权，脚本已自动乘新浪日线前复权因子（当日缓存）做近似前复权。
-- `"sina"`（新浪）：前复权准确，但分钟线接口会限流（HTTP 456），冷却几十分钟自愈。
+- `"tdxq"`（默认，通达信官方客户端 TQ 接口）：走本机已登录的通达信客户端（TdxW.exe）
+  会话取数，原生前复权、无限流；须客户端登录常开，且客户端内做过一次
+  「盘后数据下载（勾 5 分钟线）」。整池批量预取 + 本地缓存（cache/tdxq/），全池扫描秒级。
+- `"sina"`（新浪，次备）：前复权准确；分钟线接口会限流（HTTP 456），冷却几十分钟自愈；
+  已做分钟线直连+因子当日缓存优化（每股 1 次请求）。
+- `"qmt"`（国金 QMT，已接入但暂不可用）：走本机 miniQMT 客户端取数，原生前复权；
+  2026-09-14 用户 miniQMT 权限因监管收紧被收回，代码保留，权限恢复后可启用。
+- `"tdx"`（通达信，**已失效 2026-09-14**）：公开行情服务器对本机拒数（握手正常但返回
+  空数据，pytdx 交叉验证确认是服务端行为），保留代码备查，恢复前勿用。
 - `"gm"`（掘金）：须 .venv-gm 环境且终端运行；免费版 60 分钟历史有配额，仅作兜底。
 - `"em"`（东方财富）：K线接口被本机网络 WAF 封锁，本机不可用。
 
-盘中调度器 `run_scan.py` 按 **tdx → sina → gm** 顺序自动降级（失败率 >50% 即切换）。
+盘中调度器 `run_scan.py` 按 **tdxq → sina → gm** 顺序自动降级（失败率 >50% 即切换）。
 
 ## 信号定义
 
@@ -32,7 +38,7 @@ fisher_60min_scanner/
 ├── fisher_scanner.py    # 主程序（配置区在文件头部，参数可调）
 ├── build_pool_gm.py     # 五池生成器（掘金 gm 版，当前默认；跑在 .venv-gm）
 ├── build_pool_dual.py   # 三池生成器（新浪版，备用）
-├── scan_all.cmd         # 定时任务入口：全部池 + 持仓，完结确认（bar 收盘后）
+├── scan_all.cmd         # 定时任务入口：深水+观察+持仓（2026-09-14 起精简，降 sina 限流风险），完结确认（bar 收盘后）
 ├── scan_mid.cmd         # bar 中段扫描入口（--live，盘中信号）
 ├── scan_holdings.cmd    # 持仓每 15 分钟监控入口（--holdings --live）
 ├── scan_daily.cmd       # 深水池日共振收盘复核入口（--daily-confirm，15:10）
@@ -60,13 +66,10 @@ fisher_60min_scanner/
 # 建池（掘金 gm 版，约 1 分钟；需掘金终端运行并登录）
 .venv-gm\Scripts\python.exe build_pool_gm.py
 
-# 深水池 HSSR 注解（主环境 .venv，默认 tdx 800 根深历史；build_pool.cmd 已含此步）
+# 深水池 HSSR 注解（主环境 .venv，默认 sina 串行防限流约 4 分钟；build_pool.cmd 已含此步）
 .venv\Scripts\python.exe fisher_scanner.py --annotate-hssr
 
-# tdx 夜间不可用时，用 sina 兜底（串行 1.5s/股防限流，约 4 分钟）
-.venv\Scripts\python.exe fisher_scanner.py --annotate-hssr --source sina
-
-# tdx 优先、失败票自动切 sina 兜底
+# tdx 已失效（2026-09-14 服务端拒数）；--source auto 保留：tdx 优先、失败票自动切 sina 兜底
 .venv\Scripts\python.exe fisher_scanner.py --annotate-hssr --source auto
 
 # 盘中扫描（按池选用）
@@ -102,7 +105,7 @@ pip install -r requirements.txt
 两个方案的过滤/分类逻辑完全一致，输出可互相替换：
 
 ```bash
-# 盘中按策略选用（scan_all.cmd 已含全部五个池 + 持仓监控）：
+# 盘中按策略选用（2026-09-14 起盘中只扫 深水/观察/持仓，其余池暂停；建池不受影响）：
 .venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv   # 右侧
 .venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_left.csv    # 左侧
 .venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_deep.csv    # 深水
@@ -146,8 +149,8 @@ pip install -r requirements.txt
 注解步骤（`build_pool.cmd` 第二步，或手动 `fisher_scanner.py --annotate-hssr`）
 对每只股票回测历史 60m 完结 bar 上穿信号——信号出现后 10 根 bar close 上涨记成功，
 取最近 20 次可评估信号（最后 10 根 bar 内的信号不可评估，剔除），样本 < 5 留空。
-深历史走 tdx 800 根（约 200 交易日）；tdx 夜间不可用时可用 `--source sina`（串行防限流）
-或 `--source auto`（tdx 失败后自动切 sina）兜底；gm 60m 批量拉取有配额限制，不可用于此。
+深历史走 sina（tdx 2026-09-14 失效前用其 800 根约 200 交易日深历史）；
+可用 `--source auto`（tdx 失败后自动切 sina）兜底；gm 60m 批量拉取有配额限制，不可用于此。
 深水推送按档位附仓位建议：≥75% 正常仓位；50–75% 仓位减半；<50% 不建议买入；
 样本不足标注「HSSR 样本不足 (n<5)」。
 
@@ -236,8 +239,8 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 |---|---|---|
 | `fisher_建池` | 工作日 00:00 | `build_pool.cmd`（gm 重建五池 + .venv 深水池 HSSR 注解，需掘金终端运行） |
 | `fisher_持仓` | 每天 9:31–15:20 每 15 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
-| `fisher_扫描1001` / `1101` / `1331` / `1431` | 工作日对应时刻 | `scan_mid.cmd`：全部池 + 持仓，**盘中信号**（未完结 bar） |
-| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：全部池 + 持仓，**完结确认**（bar 收盘后） |
+| `fisher_扫描1001` / `1101` / `1331` / `1431` | 工作日对应时刻 | `scan_mid.cmd`：深水+观察+持仓，**盘中信号**（未完结 bar） |
+| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：深水+观察+持仓，**完结确认**（bar 收盘后） |
 | `fisher_日共振` | 工作日 15:10 | `scan_daily.cmd`：深水池日共振收盘复核（60m 日内上穿 + 当日日 K 上穿） |
 | `fisher_HSSR周报` | 每周日 20:00 | `scan_hssr.cmd`：Fisher-ESI 台账 HSSR 周报推送 |
 
