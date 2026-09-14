@@ -20,7 +20,7 @@ PERIOD = '1h'                  # kline period; NOTE: this GJ build rejects '60m'
 LENGTH = 9                   # fisher window, same as fisher_scanner.py FISHER_LEN
 HIST_BARS = 120              # bars fetched per handlebar (warmup for fisher)
 VOLUME = 100                 # fixed shares per BUY order
-USE_ENTRY_GATE = True        # buy only when 0 < fish < 2.5 (ESI entry condition)
+USE_ENTRY_GATE = False       # buy only when 0 < fish < 2.5 (ESI entry condition); False = off
 GATE_LO, GATE_HI = 0.0, 2.5
 # ----------------------------------------
 
