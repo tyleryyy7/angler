@@ -35,6 +35,10 @@
 - `cache/esi_ledger.csv` — Fisher-ESI 进出场台账（code,entry_time,entry_fisher60,
   fail_time,fail_fisher30,failed,bars_held,status；status: open/closed），cache/ 整体已 gitignore。
 - `results/`、`scanner.log`、`dual_progress.txt`、`tdxq_progress.txt` — 运行产物，gitignore。
+- `executor_v2.py` — 大QMT 内置执行器 git 主版本（项目根目录；部署/格式说明见
+  使用说明.md「大QMT 内置执行器」一节；QMT 编辑器里那份是手动拷贝的副本）。
+- `qmt-live/` — 目录联接 → D:\qmt（QMT 运行时文件：watchlist.txt / pending.csv），
+  VSCode 可视化查看编辑，gitignore。
 - `weekend test/` — 大QMT 内置策略测试资产（2026-09-12 周末完成，已纳入 git）：
   成果总结 md + fisher_test_daily_v2.py（纯信号日线版，prev off-by-one 已修复）+
   fisher_trade_test_v1.py（含下单版，零轴离场为占位规则）。架构方向：外部系统出信号

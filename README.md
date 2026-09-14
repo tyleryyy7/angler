@@ -240,14 +240,14 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 注册命令（任务不存在或需重建时执行）：
 
 ```cmd
-schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
-schtasks /create /f /tn "fisher_持仓" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_holdings.cmd" /sc minute /mo 5 /st 09:31 /et 15:20
-schtasks /create /f /tn "fisher_扫描1001" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_mid.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:01
+schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
+schtasks /create /f /tn "fisher_持仓" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_holdings.cmd" /sc minute /mo 5 /st 09:31 /et 15:20
+schtasks /create /f /tn "fisher_扫描1001" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_mid.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:01
 :: 1101 / 1331 / 1431 三条同上（scan_mid.cmd），仅改 /tn 与 /st
-schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_all.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
+schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_all.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
 :: 1131 / 1401 / 1501 三条同上（scan_all.cmd），仅改 /tn 与 /st
-schtasks /create /f /tn "fisher_日共振" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_daily.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 15:10
-schtasks /create /f /tn "fisher_HSSR周报" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_hssr.cmd" /sc weekly /d SUN /st 20:00
+schtasks /create /f /tn "fisher_日共振" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_daily.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 15:10
+schtasks /create /f /tn "fisher_HSSR周报" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_hssr.cmd" /sc weekly /d SUN /st 20:00
 ```
 
 补跑开关（新注册任务需执行一次）：
@@ -307,3 +307,27 @@ Get-ScheduledTask -TaskName "任务名" | ForEach-Object { $_.Settings.StartWhen
 
 本工具仅为量化研究辅助，输出信号不构成投资建议。Fisher 上穿在震荡市中假信号较多，
 建议结合位置（如零轴下方上穿）、成交量等条件过滤，并自行回测后再使用。
+
+## 大QMT 内置执行器（executor_v2.py）
+
+项目根目录的 `executor_v2.py` 是大QMT 内置策略的 git 主版本（编辑器里那份是手动拷贝的副本）。
+对齐扫描器 ESI v2 规则：进场 = 1h 上穿 + R1 小周期闸门（30m/15m/5m 下行段不买）；
+R2 假性失效观察（被拦票进待激活，三周期回上行且 1h 未破 → 激活买入，1h 破趋势 → 作废）；
+离场 = 1h 下穿全卖（USE_EXIT_A）+ R3 亏损即卖（30m 下穿且现价 < 成本，USE_ESI_EXIT）。
+
+### 部署
+1. 把 `executor_v2.py` 内容拷入大QMT 策略编辑器（源文件 UTF-8、纯 ASCII、py3.6、无 pandas）。
+2. 改配置区：`ACCOUNT_ID`、`VOLUME`（默认每单股数）、三个开关。
+   数据周期参数 `'1h'`——国金构建不认 `'60m'`；回测/运行界面周期建议选 5 分钟（R3 响应快）。
+3. 客户端「数据管理 → 补充数据」下载标的的 1h/30m/15m/5m 历史（至少 3 个月）。
+4. 先回测模式短区间验证，再模拟盘，再实盘（9/11 新规环境先问客户经理报备流程）。
+
+### 运行时文件（D:\qmt\，纯英文路径必须，经 qmt-live 联接在 VSCode 可见）
+- `watchlist.txt`：标的清单，每行 `CODE` 或 `CODE,VOLUME`（该票独立交易量），# 注释。
+- `pending.csv`：R2 待激活观察列表，执行器自动读写，持久化防断网/重启。
+
+### 注意
+- 持仓以账户实查为准（get_trade_detail_data），同根 1h bar 不重复下单（费雪状态值去重）。
+- T+1：当天买入不可当天卖，进场日的离场信号会被券商拒单，执行器后续 bar 自动重试。
+- R3 成本价字段按 m_dOpenPrice/m_dPositionCost/m_dCostPrice 顺序尝试，日志出现
+  cost unknown 警告时需要按账户对象实际字段名调整 get_position()。
