@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 # ----------------------- 配置区（按需修改） -----------------------
-DATA_SOURCE = "tdxq"      # 数据源："tdxq"（默认，通达信客户端 TQ，须客户端登录）/ "sina" / "qmt"（已接入，miniQMT 权限收回暂不可用）/ "tdx"（已失效）/ "gm"（须 .venv-gm）/ "em"（本机被封）
+DATA_SOURCE = "tdxq"      # 数据源："tdxq"（默认，通达信客户端 TQ，须客户端登录）/ "sina" / "gm"（须 .venv-gm）/ "em"（本机被封）
 FISHER_LEN = 9            # Fisher 窗口长度，与 Pine/同花顺参数一致
 MIN_BARS = 80             # 60分钟bar少于此数视为暖机不足，跳过（次新股、长期停牌）
 REQUEST_INTERVAL = 0.25   # 每个 worker 每只股票之间的请求间隔（秒），防限流
@@ -159,63 +159,6 @@ def _gm_symbol(code):
 
 _gm_ready = False
 
-_TDX_BAR_ENDS = ["10:30", "11:30", "14:00", "15:00"]   # 60 分钟 bar 收盘时刻（当日第 1~4 根）
-_TDX_BAR_ENDS_30 = ["10:00", "10:30", "11:00", "11:30",
-                    "13:30", "14:00", "14:30", "15:00"]  # 30 分钟 bar 收盘时刻（当日第 1~8 根）
-
-
-def _tdx_map_bar_times(df, bar_ends):
-    """tdx 分钟线盘中时间戳有跨午休怪癖（如 60m 第二根标 13:00），不读原始时间戳，
-    按「当日第几根」映射到固定收盘时刻。bar_ends 的元素数必须等于每日 bar 数。"""
-    dates = df["时间"].dt.date
-    for d in dates.unique():
-        idx = df.index[dates == d]
-        for k, i in enumerate(idx):
-            if k < len(bar_ends):
-                hh, mm = bar_ends[k].split(":")
-                df.at[i, "时间"] = datetime(d.year, d.month, d.day, int(hh), int(mm))
-
-
-def _fetch_min_tdx(code, category, count, bar_ends):
-    """通达信（xmtdx）分钟 K 线 + 近似前复权（乘新浪日线因子，当日缓存）。
-
-    复权：tdx 原始数据是不复权的，乘新浪日线前复权因子（当日缓存，与 sina 分支共用
-    cache/daily_qfq/，按 bar 日期逐日映射——除权日缺口会被因子抹平，避免 Fisher 被
-    跳空打到极端区产生假信号。因子获取失败（如新浪限流）时本股退回不复权，
-    不置 FAIL、不触发通道降级。
-    """
-    from xmtdx import TdxClient, Market
-    market = Market.SH if code.startswith(("5", "6")) else Market.SZ
-    with TdxClient.from_best_host(ping_timeout=3.0) as c:
-        bars = c.get_security_bars(market, code, category, 0, count)
-    if not bars:
-        return None
-    df = pd.DataFrame([{"时间": datetime(b.year, b.month, b.day),
-                        "最高": b.high, "最低": b.low, "收盘": b.close} for b in bars])
-    _tdx_map_bar_times(df, bar_ends)
-    try:
-        fac = _daily_qfq_factor(code)                     # 新浪日线前复权因子（当日缓存）
-        fmap = dict(zip(fac["date"], fac["factor"]))
-        factor = df["时间"].dt.strftime("%Y-%m-%d").map(fmap).ffill().fillna(1.0)
-        for col in ("最高", "最低", "收盘"):
-            df[col] = df[col].astype(float) * factor.values
-    except Exception as e:
-        logging.warning("%s 复权因子获取失败，本股退回不复权数据: %s", code, e)
-    return df
-
-
-def _fetch_60m_tdx(code, count=200):
-    """通达信 60 分钟 K 线（见 _fetch_min_tdx 复权/时间映射说明）。
-    count 单次上限 800（≈200 交易日），HSSR 回测用 800 深历史。"""
-    from xmtdx import KlineCategory
-    return _fetch_min_tdx(code, KlineCategory.MIN_60, count, _TDX_BAR_ENDS)
-
-
-def _fetch_30m_tdx(code):
-    """通达信 30 分钟 K 线（见 _fetch_min_tdx 复权/时间映射说明）。
-    count=600（单次上限 800）：30m 每天 8 根，约 75 个交易日，保证 Fisher 暖机。"""
-    from xmtdx import KlineCategory
-    return _fetch_min_tdx(code, KlineCategory.MIN_30, 600, _TDX_BAR_ENDS_30)
 
 def _fetch_60m_gm(code):
     """掘金 60 分钟前复权 K 线。注意 gm 的 frequency='3600s' 才是 60 分钟（'60s' 是 1 分钟）。"""
@@ -314,43 +257,6 @@ def _fetch_30m_sina(code):
     return _fetch_min_sina(code, 30)
 
 
-def _qmt_symbol(code):
-    """qmt 代码格式：沪 6/5 开头 -> xxxxxx.SH，其余 -> xxxxxx.SZ。"""
-    return code + (".SH" if code.startswith(("5", "6")) else ".SZ")
-
-
-def _fetch_min_qmt(code, period, count):
-    """国金 QMT（xtquant/xtdata）分钟 K 线，原生前复权（dividend_type='front'）。
-
-    依赖本机 miniQMT（XtMiniQmt.exe）登录运行。2026-09-14：用户 miniQMT 权限被
-    监管收紧收回，通道暂不可用；代码保留，权限恢复后把 DATA_SOURCE/CHANNELS
-    切回 qmt 即可启用。bar 时间即收盘时刻，无需 tdx 式时间映射。
-    """
-    from xtquant import xtdata
-    stock = _qmt_symbol(code)
-    xtdata.download_history_data(stock, period)
-    d = xtdata.get_market_data_ex([], [stock], period=period, count=count,
-                                  dividend_type="front")
-    df = d.get(stock)
-    if df is None or len(df) == 0:
-        return None
-    out = pd.DataFrame({
-        "时间": pd.to_datetime(df["time"], unit="ms"),
-        "最高": df["high"].astype(float),
-        "最低": df["low"].astype(float),
-        "收盘": df["close"].astype(float),
-    })
-    return out
-
-
-def _fetch_60m_qmt(code, count=800):
-    return _fetch_min_qmt(code, "60m", count)
-
-
-def _fetch_30m_qmt(code):
-    return _fetch_min_qmt(code, "30m", 600)
-
-
 # ---------------- tdxq：官方通达信客户端 TQ 接口 ----------------
 TDXQ_FETCH = r"D:\tdx\PYPlugins\user\tdxq_fetch.py"   # 批量取数助手（TQ 路径锁死，必须在那里）
 TDXQ_CACHE_DIR = CACHE_DIR / "tdxq"                     # 每股一个 CSV：{code}_{period}.csv
@@ -419,8 +325,8 @@ def _fetch_30m_tdxq(code):
 def fetch_60m(code, source=None, count=None):
     """拉取单只股票的 60 分钟前复权 K 线，带重试。失败返回 None。
 
-    source: "sina"（默认）/ "tdxq"（通达信客户端 TQ，须客户端登录，整池预取+本地缓存）/ "qmt"（已接入，miniQMT 权限收回暂不可用）/ "tdx"（已失效 2026-09-14）/ "gm"（须在 .venv-gm 运行）/ "em"（东财）。
-    count: 仅 tdx/qmt/tdxq 源生效（单次上限 800），None 时用各源默认深度。
+    source: "tdxq"（默认，通达信客户端 TQ，须客户端登录，整池预取+本地缓存）/ "sina" / "gm"（须在 .venv-gm 运行）/ "em"（东财）。
+    count: 仅 tdxq 源生效（单次上限 800），None 时用各源默认深度。
     """
     source = source or DATA_SOURCE
     for k in range(RETRY):
@@ -431,14 +337,6 @@ def fetch_60m(code, source=None, count=None):
                     return df
             elif source == "tdxq":
                 df = _fetch_60m_tdxq(code, count or 800)
-                if df is not None and len(df) > 0:
-                    return df
-            elif source == "qmt":
-                df = _fetch_60m_qmt(code, count or 800)
-                if df is not None and len(df) > 0:
-                    return df
-            elif source == "tdx":
-                df = _fetch_60m_tdx(code, count) if count else _fetch_60m_tdx(code)
                 if df is not None and len(df) > 0:
                     return df
             elif source == "sina":
@@ -458,7 +356,7 @@ def fetch_60m(code, source=None, count=None):
 
 def fetch_30m(code, source=None):
     """拉取单只股票的 30 分钟前复权 K 线，带重试。失败返回 None。
-    结构同 fetch_60m；tdx 用 MIN_30/count=600，sina 用 scale=30。"""
+    结构同 fetch_60m；tdxq 用 30m 缓存，sina 用 scale=30。"""
     source = source or DATA_SOURCE
     for k in range(RETRY):
         try:
@@ -468,14 +366,6 @@ def fetch_30m(code, source=None):
                     return df
             elif source == "tdxq":
                 df = _fetch_30m_tdxq(code)
-                if df is not None and len(df) > 0:
-                    return df
-            elif source == "qmt":
-                df = _fetch_30m_qmt(code)
-                if df is not None and len(df) > 0:
-                    return df
-            elif source == "tdx":
-                df = _fetch_30m_tdx(code)
                 if df is not None and len(df) > 0:
                     return df
             elif source == "sina":
@@ -1098,7 +988,7 @@ def hssr_report(now=None):
 # 价格版口径：历史完结 60m bar 上穿信号（just_crossed_up，无 ESI 过滤）出现后
 # N_HOLD 根 bar close 上涨记成功；取最近 N_SIGNALS 次可评估信号（最后 N_HOLD 根
 # 内的信号尚无足够后续 bar，剔除）；样本 < 5 记样本不足。
-# 深历史曾走 tdx 800 根（≈200 交易日），tdx 失效后改 sina；gm 60m 批量拉取有配额坑（status 1014），不可用于此。
+# 深历史走 sina（tdx 公开服务器 2026-09-14 起拒数，通道已删）；gm 60m 批量拉取有配额坑（status 1014），不可用于此。
 HSSR_N_HOLD = 10        # 成功判定持有窗口（60m bar 数）
 HSSR_N_SIGNALS = 20     # 统计窗口：最近 N 次可评估信号
 HSSR_MIN_SAMPLE = 5     # 可评估样本少于此数视为样本不足（hssr 留空）
@@ -1108,7 +998,7 @@ def compute_hssr(code, n_hold=HSSR_N_HOLD, n_signals=HSSR_N_SIGNALS, source="sin
     """单只股票 60m 历史上穿信号成功率。返回 (hssr 百分数或 None, n_eval)。
 
     样本不足（n_eval < HSSR_MIN_SAMPLE）返回 (None, n_eval)；取数失败返回 (None, 0)。
-    source: sina（默认，串行防限流）/ tdx（已失效 2026-09-14）。
+    source: sina（默认，串行防限流）。
     """
     df = fetch_60m(code, source=source, count=800)
     # sina 限流严格，拉长间隔；tdx 保持原速
@@ -1134,7 +1024,7 @@ def annotate_pool_hssr(pool_file="pool_deep.csv", source="sina"):
 
     主环境 .venv 运行；整体 try/except，任何异常保留原文件不破坏。
     hssr 为百分数数值（样本不足留空），hssr_n 为可评估样本数。
-    source: sina（默认，串行防限流；2026-09-14 tdx 失效后切换）/ tdx（已失效）/ auto。
+    source: sina（默认，串行防限流）；auto 为历史兼容别名，现等价于 sina（tdx 已删）。
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
     path = Path(__file__).resolve().parent / pool_file
@@ -1160,14 +1050,9 @@ def annotate_pool_hssr(pool_file="pool_deep.csv", source="sina"):
                     if done % 20 == 0:
                         logging.info("HSSR 注解进度 %d/%d (%s)", done, len(codes), src)
 
-        if source == "auto":
-            _run("tdx", pool["code"].tolist())
-            failed = [c for c in pool["code"] if results.get(str(c), (None, 0))[0] is None]
-            if failed:
-                logging.info("tdx 失败/样本不足 %d 只，切 sina 兜底", len(failed))
-                _run("sina", failed)
-        else:
-            _run(source, pool["code"].tolist())
+        if source == "auto":   # tdx 通道已删（2026-09-14），auto 退化为 sina
+            source = "sina"
+        _run(source, pool["code"].tolist())
 
         pool["hssr"] = pool["code"].map(lambda c: results.get(str(c), (None, 0))[0])
         pool["hssr_n"] = pool["code"].map(lambda c: results.get(str(c), (None, 0))[1])
@@ -1496,9 +1381,9 @@ def main():
     parser.add_argument("--limit", type=int, help="只扫描前 N 只（调试）")
     parser.add_argument("--side", choices=["up", "down"], default="up",
                         help="up=上穿（默认，选股），down=下穿（持仓监控）")
-    parser.add_argument("--source", choices=["sina", "gm", "em", "tdx", "qmt", "tdxq", "auto"], default=None,
+    parser.add_argument("--source", choices=["sina", "gm", "em", "tdxq", "auto"], default=None,
                         help="数据源（缺省用配置区 DATA_SOURCE）；gm 须在 .venv-gm 环境运行；"
-                             "auto 仅用于 --annotate-hssr（tdx 失败后 sina 兜底）")
+                             "auto 仅用于 --annotate-hssr（等价 sina，历史兼容）")
     parser.add_argument("--buy", metavar="CODE", help="登记买入到 holdings.csv 后退出")
     parser.add_argument("--price", type=float, help="买入价（配合 --buy，缺省取最新价）")
     parser.add_argument("--sell", metavar="CODE", help="清仓：移出持仓并加入观察池后退出")
@@ -1512,8 +1397,7 @@ def main():
                         help="推送 Fisher-ESI 台账 HSSR 周报后退出")
     parser.add_argument("--annotate-hssr", action="store_true",
                         help="深水池 HSSR 预计算：为 --pool-file（默认 pool_deep.csv）"
-                             "追加 hssr/hssr_n 两列后退出（主环境 .venv，默认走 sina 串行防限流；"
-                             "--source auto 则 tdx 失败后 sina 兜底，tdx 已失效 2026-09-14）")
+                             "追加 hssr/hssr_n 两列后退出（主环境 .venv，默认走 sina 串行防限流）")
     parser.add_argument("--inspect", metavar="CODE或名称",
                         help="单票体检：输出该票完整画像（身份/日线/60m/30m+ESI/HSSR）后退出；"
                              "名称从各池/持仓/观察池 CSV 反查代码")
@@ -1526,7 +1410,7 @@ def main():
         inspect_stock(args.inspect, push=args.push, source=source)
         return
     if args.annotate_hssr:
-        src = args.source or "tdx"
+        src = args.source or "sina"
         annotate_pool_hssr(args.pool_file or "pool_deep.csv", source=src)
         return
     if args.hssr_report:

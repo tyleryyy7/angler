@@ -12,12 +12,10 @@
   「盘后数据下载（勾 5 分钟线）」。整池批量预取 + 本地缓存（cache/tdxq/），全池扫描秒级。
 - `"sina"`（新浪，次备）：前复权准确；分钟线接口会限流（HTTP 456），冷却几十分钟自愈；
   已做分钟线直连+因子当日缓存优化（每股 1 次请求）。
-- `"qmt"`（国金 QMT，已接入但暂不可用）：走本机 miniQMT 客户端取数，原生前复权；
-  2026-09-14 用户 miniQMT 权限因监管收紧被收回，代码保留，权限恢复后可启用。
-- `"tdx"`（通达信，**已失效 2026-09-14**）：公开行情服务器对本机拒数（握手正常但返回
-  空数据，pytdx 交叉验证确认是服务端行为），保留代码备查，恢复前勿用。
 - `"gm"`（掘金）：须 .venv-gm 环境且终端运行；免费版 60 分钟历史有配额，仅作兜底。
 - `"em"`（东方财富）：K线接口被本机网络 WAF 封锁，本机不可用。
+- ~~tdx~~（通达信公开服务器，已删 2026-09-14）：服务端整体拒数，git 历史可查。
+- ~~qmt~~（国金 miniQMT，已删 2026-09-14）：权限被收回，git 历史可查。
 
 盘中调度器 `run_scan.py` 按 **tdxq → sina → gm** 顺序自动降级（失败率 >50% 即切换）。
 
@@ -68,9 +66,6 @@ fisher_60min_scanner/
 
 # 深水池 HSSR 注解（主环境 .venv，默认 sina 串行防限流约 4 分钟；build_pool.cmd 已含此步）
 .venv\Scripts\python.exe fisher_scanner.py --annotate-hssr
-
-# tdx 已失效（2026-09-14 服务端拒数）；--source auto 保留：tdx 优先、失败票自动切 sina 兜底
-.venv\Scripts\python.exe fisher_scanner.py --annotate-hssr --source auto
 
 # 盘中扫描（按池选用）
 .venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv
@@ -149,8 +144,7 @@ pip install -r requirements.txt
 注解步骤（`build_pool.cmd` 第二步，或手动 `fisher_scanner.py --annotate-hssr`）
 对每只股票回测历史 60m 完结 bar 上穿信号——信号出现后 10 根 bar close 上涨记成功，
 取最近 20 次可评估信号（最后 10 根 bar 内的信号不可评估，剔除），样本 < 5 留空。
-深历史走 sina（tdx 2026-09-14 失效前用其 800 根约 200 交易日深历史）；
-可用 `--source auto`（tdx 失败后自动切 sina）兜底；gm 60m 批量拉取有配额限制，不可用于此。
+深历史走 sina；gm 60m 批量拉取有配额限制，不可用于此。
 深水推送按档位附仓位建议：≥75% 正常仓位；50–75% 仓位减半；<50% 不建议买入；
 样本不足标注「HSSR 样本不足 (n<5)」。
 
