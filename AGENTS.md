@@ -22,7 +22,7 @@
 - `build_pool.py` — 已删除（旧单池方案，git 历史可查）。
 - `scan_all.cmd` — 盘中扫描入口（收盘完结确认，无参数，CRLF 换行，勿改 LF）。
 - `scan_mid.cmd` — bar 中段扫描入口：`run_scan.py --live`（未完结 bar 也判定，CRLF）。
-- `scan_holdings.cmd` — 持仓每 15 分钟监控入口：`run_scan.py --holdings --live`（CRLF）。
+- `scan_holdings.cmd` — 持仓每 5 分钟监控入口：`run_scan.py --holdings --live`（CRLF）。
 - `scan_daily.cmd` — 深水池日共振收盘复核入口：`run_scan.py --daily-confirm`（CRLF）。
 - `scan_hssr.cmd` — HSSR 周报入口：`run_scan.py --hssr-report`（CRLF）。
 - `build_pool.cmd` — 建池任务入口（CRLF）：`.build_lock` 互斥锁 + tdxq 建五池 + `.venv` 深水池 HSSR 注解。
@@ -69,7 +69,7 @@
 - R1 进场过滤（所有买入信号，各池通用）：60m 上穿命中时检查 30m/15m/5m，任一周期
   处于下行段（fish < trigger）→ bar_state=假性失效，推送标注「待激活」并写入
   esi_pending（`esi_register_pending`，--once 与 run_scan 都挂钩）。
-- R2 信号激活：pending 票由持仓任务每 15 分钟复查（`check_pending_activation`）：
+- R2 信号激活：pending 票由持仓任务每 5 分钟复查（`check_pending_activation`）：
   三周期在信号后都重新上穿过且当前 fish > trigger，且 60m fish > trigger（趋势未破坏）
   → 推送「信号激活」并台账记 open（entry_time=激活时刻）；60m fish < trigger → void 作废。
 - 进场登记（`esi_register_entries`）：完结且非假性失效的持仓上穿信号，0 < fisher < 2.5
@@ -91,7 +91,7 @@
 
 - `fisher_建池` 00:00 周一~周五 → build_pool.cmd（tdxq 建五池 + HSSR 注解两步，
   **需通达信客户端（TdxW.exe）运行并登录**）
-- `fisher_持仓` 每天 9:31–15:20 每 15 分钟 → scan_holdings.cmd
+- `fisher_持仓` 每天 9:31–15:20 每 5 分钟 → scan_holdings.cmd
   （daily 任务，周末由 run_scan.py 内的 weekday 保护直接退出；节假日空跑但不会重复推送，去重兜底）
 - `fisher_扫描1001/1101/1331/1431` 周一~周五 → scan_mid.cmd（bar 中段，--live 盘中信号）
 - `fisher_扫描1031/1131/1401/1501` 周一~周五 → scan_all.cmd（bar 收盘后，完结确认）
@@ -138,7 +138,7 @@
 
 `run_scan.py` 是盘中扫描调度器：依次扫持仓（下穿+上穿）→ 深水池 → 观察池，通道失败率 >50% 自动降级。
 2026-09-14 起为降 sina 限流风险，右侧/左侧/T0/T1 池盘中扫描暂停（POOLS 注释里可一键恢复），建池不受影响。
-参数：`--holdings` 只扫持仓两项（每 15 分钟任务用）；`--live` 盘中未完结 bar 参与判定（中段任务用）；无参数 = 全量完结确认。
+参数：`--holdings` 只扫持仓两项（每 5 分钟任务用）；`--live` 盘中未完结 bar 参与判定（中段任务用）；无参数 = 全量完结确认。
 `fisher_scanner.py --source tdxq|sina|em` 可手动指定通道，`--live` 可手动跑盘中信号。
 
 ## 踩过的坑（改代码前必读）

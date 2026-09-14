@@ -38,7 +38,7 @@ fisher_60min_scanner/
 ├── build_pool_dual.py   # 三池生成器（新浪版，备用）
 ├── scan_all.cmd         # 定时任务入口：深水+观察+持仓（2026-09-14 起精简，降 sina 限流风险），完结确认（bar 收盘后）
 ├── scan_mid.cmd         # bar 中段扫描入口（--live，盘中信号）
-├── scan_holdings.cmd    # 持仓每 15 分钟监控入口（--holdings --live）
+├── scan_holdings.cmd    # 持仓每 5 分钟监控入口（--holdings --live）
 ├── scan_daily.cmd       # 深水池日共振收盘复核入口（--daily-confirm，15:10）
 ├── scan_hssr.cmd        # HSSR 周报入口（--hssr-report，每周日 20:00）
 ├── build_pool.cmd       # 建池任务入口（.build_lock 互斥锁 + tdxq 建五池 + .venv 深水池 HSSR 注解）
@@ -55,7 +55,7 @@ fisher_60min_scanner/
 
 全自动：Windows 计划任务工作日 00:00 建池（tdxq 版，须通达信客户端登录在线）；盘中每根 60 分钟 bar 的中段
 （10:01/11:01/13:31/14:31，四根 bar 的中点）扫盘中信号（未完结 bar）、收盘后（10:31/11:31/14:01/15:01）
-扫完结确认，全部池 + 持仓并推送企业微信；持仓另加每 15 分钟（9:31 起）高频监控
+扫完结确认，全部池 + 持仓并推送企业微信；持仓另加每 5 分钟（9:31 起）高频监控
 （见下文「正式运行」）。
 
 手动命令：
@@ -188,7 +188,7 @@ HSSR（现场计算，附仓位档位）。单项取数失败只标注「取数�
 
 - **进场过滤（所有买入信号）**：60m 上穿命中时，30m/15m/5m 任一周期处于下行段
   （fish < trigger）→ 信号记「假性失效」，推送标注「待激活」，不作为有效买入。
-- **信号激活**：假性失效票由持仓监控任务每 15 分钟复查：三周期全部重新上穿
+- **信号激活**：假性失效票由持仓监控任务每 5 分钟复查：三周期全部重新上穿
   且 60m 趋势未破坏（fish > trigger）→ 推送「信号激活」，正式登记进场。
 - **进场登记**：通过过滤的持仓完结 60m 上穿（0 < fisher < 2.5）→ 台账记 open；
   当日已有 failed 记录的票当日禁止重新开仓。
@@ -228,7 +228,7 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 | 任务名 | 触发 | 动作 |
 |---|---|---|
 | `fisher_建池` | 工作日 00:00 | `build_pool.cmd`（tdxq 重建五池 + .venv 深水池 HSSR 注解，需通达信客户端登录在线） |
-| `fisher_持仓` | 每天 9:31–15:20 每 15 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
+| `fisher_持仓` | 每天 9:31–15:20 每 5 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
 | `fisher_扫描1001` / `1101` / `1331` / `1431` | 工作日对应时刻 | `scan_mid.cmd`：深水+观察+持仓，**盘中信号**（未完结 bar） |
 | `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：深水+观察+持仓，**完结确认**（bar 收盘后） |
 | `fisher_日共振` | 工作日 15:10 | `scan_daily.cmd`：深水池日共振收盘复核（60m 日内上穿 + 当日日 K 上穿） |
@@ -241,7 +241,7 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 
 ```cmd
 schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
-schtasks /create /f /tn "fisher_持仓" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_holdings.cmd" /sc minute /mo 15 /st 09:31 /et 15:20
+schtasks /create /f /tn "fisher_持仓" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_holdings.cmd" /sc minute /mo 5 /st 09:31 /et 15:20
 schtasks /create /f /tn "fisher_扫描1001" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_mid.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:01
 :: 1101 / 1331 / 1431 三条同上（scan_mid.cmd），仅改 /tn 与 /st
 schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\钓鱼\run_hidden.vbs\" scan_all.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
