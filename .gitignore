@@ -20,4 +20,6 @@ tdxq_progress.txt
 results/
 scanner.log
 cache/
+qmt-live/
+
 .build_lock/
