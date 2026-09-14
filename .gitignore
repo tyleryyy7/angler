@@ -16,6 +16,7 @@ watchlist.csv
 pool*.csv
 dual_progress.txt
 gm_progress.txt
+tdxq_progress.txt
 results/
 scanner.log
 cache/
