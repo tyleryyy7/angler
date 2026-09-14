@@ -4,12 +4,15 @@
 - `executor_v1.py` — 大QMT 内置策略：60m 费雪上穿买 / 下穿卖，固定 100 股/单，
   手动标的自判自执行。费雪口径与外部 fisher_scanner.py 逐位一致（2026-09-14 验证）。
 - `watchlist.txt` — 手动标的清单（每行一个标准代码，`#` 注释）。
+  **运行副本必须放在纯英文路径 `D:\qmt\watchlist.txt`**（大QMT 内置环境按 GBK 读源文件，
+  路径含中文会直接 SyntaxError；仓库里这份是模板，改清单改 D:\qmt 那份）。
 
 ## 部署步骤
 1. 把 `executor_v1.py` 内容拷入大QMT 策略编辑器（源文件 UTF-8；内置环境 py3.6、
    无 pandas，勿引入外部库）。
 2. 修改文件头部配置：`ACCOUNT_ID`（资金账号）、`VOLUME`（每单股数）、
-   `WATCHLIST_FILE`（清单路径）、`USE_ENTRY_GATE`（买入闸门 0<fish<2.5 开关）。
+   `WATCHLIST_FILE`（清单路径，**必须纯英文路径**，中文路径会 SyntaxError）、
+   `USE_ENTRY_GATE`（买入闸门 0<fish<2.5 开关）。
 3. 客户端「数据管理 → 补充数据」下载清单内标的的 60 分钟 K 线（至少 3 个月），
    否则历史不足只打印 warming up。
 4. 先回测模式短区间验证（信号不重复、成交一一对应），再模拟盘，再实盘。

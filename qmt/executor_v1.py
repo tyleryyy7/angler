@@ -14,7 +14,7 @@ import math
 
 # ---------------- config ----------------
 ACCOUNT_ID = 'test'          # TODO: set your account id
-WATCHLIST_FILE = r'D:\钓鱼\qmt\watchlist.txt'
+WATCHLIST_FILE = r'D:\qmt\watchlist.txt'   # must be an ASCII-only path (QMT builtin env misreads non-ASCII)
 FALLBACK_CODES = ['600519.SH']   # used when the watchlist file is unreadable
 LENGTH = 9                   # fisher window, same as fisher_scanner.py FISHER_LEN
 HIST_BARS = 120              # bars fetched per handlebar (warmup for fisher)
