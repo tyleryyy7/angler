@@ -123,12 +123,19 @@ def main():
         fake_args = SimpleNamespace(pool_file=pool_file)
         result = scan_with_failover(pool, pool_file, fs.pool_label(fake_args),
                                     fs.pool_tag(fake_args), side, live=args.live)
-        # Fisher-ESI：持仓完结 60m 上穿 → 进场登记（台账去重：open/当日 failed 跳过）
-        if args.holdings and side == "up" and result is not None and len(result):
-            fs.esi_register_entries(result)
+        # Fisher-ESI v2：上穿信号分流——假性失效入待激活台账，其余完结信号进场登记
+        if side == "up" and result is not None and len(result):
+            fs.esi_register_pending(result)
+            if args.holdings:
+                fs.esi_register_entries(result)
+        # 持仓 60m 下穿命中 → 对应 open 台账记正常离场（failed=否）
+        if args.holdings and side == "down" and result is not None and len(result):
+            fs.esi_close_on_60m_down(result)
 
-    # Fisher-ESI 失效判定：只在 30m bar 收盘后窗口跑（每 15 分钟持仓任务的网格上）
+    # Fisher-ESI v2：持仓任务每次复查待激活（R2 信号激活）
     if args.holdings:
+        fs.check_pending_activation()
+        # R3 失效卖出判定：只在 30m bar 收盘后窗口跑（每 15 分钟持仓任务的网格上）
         now = datetime.now()
         hm = now.strftime("%H:%M")
         if any(a <= hm <= b for a, b in fs.ESI_JUDGE_WINDOWS):

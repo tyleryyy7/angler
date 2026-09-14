@@ -181,19 +181,20 @@ pip install -r requirements.txt
 最近一次上穿/下穿时间）、30m+ESI（台账记录与 open 窗口进度 x/6）、
 HSSR（现场计算，附仓位档位）。单项取数失败只标注「取数失败」，不影响其他段。
 
-### Fisher-ESI 早期失效规则（持仓版）
+### Fisher-ESI 规则 v2（2026-09-14 重写）
 
-对持仓票的 60m 上穿进场做「早期失效」跟踪，台账存 `cache/esi_ledger.csv`：
+买入信号的小周期共振过滤 + 持仓失效卖出，台账 `cache/esi_ledger.csv`（进场/离场）
++ `cache/esi_pending.csv`（假性失效待激活）：
 
-- **进场登记**：持仓票出现**完结** 60m bar Fisher 上穿，且 0 < fisher < 2.5 → 台账记 open
-  （`run_scan.py --holdings` 上穿扫描后自动调用；已有 open 或当日已 failed 的票不重复登记，
-  当日禁止重新开仓）。
-- **失效判定（Fisher-Fail）**：自进场 bar 起 6 根完结 30m bar 窗口（3 交易小时）内，
-  同时满足 ①完结 30m bar Fisher 下穿 Trigger；②最新 60m bar（允许未完结）fisher > 0
-  且环比下降（大周期未死但开始走弱）→ 记 failed=是，推送「Fisher失效」平仓预警。
-  判定在 30m bar 收盘后窗口（10:01-10:15 / 10:31-10:45 / … / 15:01-15:15，
-  正好落在每 15 分钟持仓任务的网格上）自动执行。
-- **窗口存活**：满 6 根 30m bar 未失效 → 记成功（failed=否，bars_held=6）。
+- **进场过滤（所有买入信号）**：60m 上穿命中时，30m/15m/5m 任一周期处于下行段
+  （fish < trigger）→ 信号记「假性失效」，推送标注「待激活」，不作为有效买入。
+- **信号激活**：假性失效票由持仓监控任务每 15 分钟复查：三周期全部重新上穿
+  且 60m 趋势未破坏（fish > trigger）→ 推送「信号激活」，正式登记进场。
+- **进场登记**：通过过滤的持仓完结 60m 上穿（0 < fisher < 2.5）→ 台账记 open；
+  当日已有 failed 记录的票当日禁止重新开仓。
+- **失效卖出**：进场后任一完结 30m bar 下穿时——浮亏（现价 < 进场价）→ 立即推送
+  「Fisher失效」卖出预警，记 failed=是；浮盈 → 继续持有，等 60m 下穿正常离场
+  （记 failed=否）。
 - **HSSR 周报**：按 code 取最近 20 条 closed 台账记录，HSSR = 未失效数/总数，
   附平均失效分钟数，每周日 20:00 推送企业微信。手动跑：
   `.venv\Scripts\python.exe run_scan.py --hssr-report`。

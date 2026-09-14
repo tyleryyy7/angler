@@ -55,7 +55,8 @@ LOG_FILE = Path(__file__).resolve().parent / "scanner.log"
 CACHE_DIR = Path(__file__).resolve().parent / "cache" / "daily_qfq"  # 日线复权因子缓存（当日有效）
 PUSHED_FILE = Path(__file__).resolve().parent / "cache" / "pushed_signals.json"  # 当日已推送信号去重记录
 ESI_LEDGER = Path(__file__).resolve().parent / "cache" / "esi_ledger.csv"  # Fisher-ESI 进出场台账
-ESI_WINDOW_BARS = 6           # 失效判定窗口：进场后 6 根完结 30m bar（3 交易小时）
+ESI_PENDING = Path(__file__).resolve().parent / "cache" / "esi_pending.csv"  # 假性失效待激活台账
+ESI_WINDOW_BARS = 6           # 已废弃（旧失效窗口规则，2026-09-14 重写后不再使用）
 ESI_ENTRY_FISHER_MAX = 2.5    # 进场登记：上穿时 60m fisher 上限
 # 30m bar 收盘后判定窗口（每 15 分钟持仓任务网格上）：当前时刻落在区间内才跑失效判定
 ESI_JUDGE_WINDOWS = [("10:01", "10:15"), ("10:31", "10:45"), ("11:01", "11:15"),
@@ -329,6 +330,60 @@ def fetch_30m(code, source=None):
     return None
 
 
+def _fetch_small_tf(code, scale, source=None):
+    """15m/5m 前复权 K 线（ESI 小周期共振用）。sina 用 scale 直连；tdxq 用对应周期缓存；
+    em 兜底。失败返回 None。"""
+    source = source or DATA_SOURCE
+    tdxq_period = "%dm" % scale
+    for k in range(RETRY):
+        try:
+            if source == "tdxq":
+                df = _fetch_tdxq(code, tdxq_period, 600)
+                if df is not None and len(df) > 0:
+                    return df
+            elif source == "sina":
+                df = _fetch_min_sina(code, scale)
+                if df is not None and len(df) > 0:
+                    return df
+            else:
+                import akshare as ak
+                df = ak.stock_zh_a_hist_min_em(symbol=code, period=str(scale), adjust="qfq")
+                if df is not None and len(df) > 0:
+                    return df
+        except Exception as e:
+            logging.warning("%s %dm 第 %d 次拉取失败: %s", code, scale, k + 1, e)
+        time.sleep(1.0 * (k + 1))
+    return None
+
+
+def fetch_15m(code, source=None):
+    return _fetch_small_tf(code, 15, source)
+
+
+def fetch_5m(code, source=None):
+    return _fetch_small_tf(code, 5, source)
+
+
+def small_tf_state(code, source=None):
+    """ESI 小周期共振：返回 {周期: (fish, trigger, 是否下行)}；下行 = fish < trigger
+    （最新完结 bar 处于下穿后的下行段）。取数失败的周期记 None（判定时按不下行处理并记日志）。"""
+    out = {}
+    for label, fn in (("30m", fetch_30m), ("15m", fetch_15m), ("5m", fetch_5m)):
+        df = fn(code, source)
+        if source != "tdxq":
+            time.sleep(REQUEST_INTERVAL)
+        if df is None or len(df) < MIN_BARS:
+            logging.warning("小周期状态: %s %s 取数失败/不足", code, label)
+            out[label] = None
+            continue
+        high = pd.to_numeric(df["最高"], errors="coerce").values
+        low = pd.to_numeric(df["最低"], errors="coerce").values
+        fish, trig = fisher_transform(high, low, FISHER_LEN)
+        out[label] = (round(float(fish[-1]), 3), round(float(trig[-1]), 3),
+                      bool(fish[-1] < trig[-1]))
+    return out
+
+
 def get_pool():
     """沪深 A 股股票池：排除北交所、ST/退市、停牌（最新价为 0/空）。
 
@@ -383,15 +438,25 @@ def scan_one(row, side="up", source=None, live=False):
     crossed = just_crossed_down(fish, trig, j) if side == "down" else just_crossed_up(fish, trig, j)
     if crossed:
         bar_ts = pd.to_datetime(df["时间"].iloc[j])
-        return {
+        bar_state = "未完结" if bar_ts.date() == now.date() and now < bar_ts else "完结"
+        hit = {
             "code": code, "name": name,
             "bar_time": str(df["时间"].iloc[j]),
             "close": float(pd.to_numeric(df["收盘"], errors="coerce").iloc[j]),
             "fisher": round(float(fish[j]), 3),
             "trigger": round(float(trig[j]), 3),
-            # 当日且尚未到 bar 结束时刻 → 未完结（盘中信号）
-            "bar_state": "未完结" if bar_ts.date() == now.date() and now < bar_ts else "完结",
+            "bar_state": bar_state,
         }
+        if side == "up":
+            # R1 小周期共振闸门：30m/15m/5m 任一处于下行段 → 假性失效（待激活）
+            st = small_tf_state(code, source)
+            downs = [k for k, v in st.items() if v and v[2]]
+            hit["small_tf"] = ";".join(
+                "%s%s" % (k, "↓" if (v and v[2]) else ("?" if v is None else "↑"))
+                for k, v in st.items())
+            if downs:
+                hit["bar_state"] = "假性失效"
+        return hit
     return None
 
 
@@ -674,11 +739,16 @@ def notify(result, pond="鱼塘", side="up"):
         result = result.iloc[keep].reset_index(drop=True)
         keys = [keys[i] for i in keep]
         has_live = "bar_state" in result.columns and (result["bar_state"] == "未完结").any()
-        title = "**%s：%d 条鱼%s%s**" % (pond, len(result), suffix,
-                                        "（含盘中信号，bar 未完结）" if has_live else "")
+        has_fake = "bar_state" in result.columns and (result["bar_state"] == "假性失效").any()
+        title = "**%s：%d 条鱼%s%s%s**" % (
+            pond, len(result), suffix,
+            "（含盘中信号，bar 未完结）" if has_live else "",
+            "（含假性失效，待小周期激活）" if has_fake else "")
 
         def _row_text(r):
-            tag = "（未完结）" if r.get("bar_state") == "未完结" else ""
+            tag = ("（假性失效，待激活 %s）" % r.get("small_tf", "")
+                   ) if r.get("bar_state") == "假性失效" else (
+                "（未完结）" if r.get("bar_state") == "未完结" else "")
             if "score" in result.columns:   # 带打分的池附分数
                 text = "%s %s（%s）%s" % (r["code"], r["name"], r["score"], tag)
                 if "hssr" in result.columns:   # 深水池 HSSR 档位（建池时预计算）
@@ -742,13 +812,20 @@ def _save_list(filename, df):
     df.to_csv(Path(__file__).resolve().parent / filename, index=False, encoding="utf-8-sig")
 
 
-# ----------------------- Fisher-ESI 早期失效规则（持仓版） -----------------------
-# 进场：持仓票完结 60m bar Fisher 上穿且 0 < fisher < 2.5 → 台账登记 open。
-# 失效：进场起 6 根完结 30m bar 窗口内，完结 30m bar 下穿 Trigger 且最新 60m bar
-# （允许未完结）fisher > 0 且环比下降 → Fisher-Fail（推送「Fisher失效」平仓预警）。
-# 窗口内存活满 6 根未失效 → 记成功 closed。HSSR = 近 20 条 closed 中未失效占比，周日推送。
-ESI_COLUMNS = ["code", "entry_time", "entry_fisher60", "fail_time",
+# ---------------- Fisher-ESI 规则 v2（2026-09-14 重写） ----------------
+# R1 进场过滤（所有买入信号）：60m 上穿时，30m/15m/5m 任一小周期处于下行段
+# （fish < trigger）→ 信号记「假性失效」，推送标注并写入待激活台账（esi_pending.csv）。
+# R2 信号激活：pending 票由持仓任务每 15 分钟复查，5m/15m/30m 全部重新上穿过
+# （signal_time 之后出现过上穿且当前 fish > trigger）且 60m fish > trigger
+# → 推送「信号激活」并正式登记 open；60m fish < trigger → 记 void 作废。
+# R3 持仓失效卖出（替换旧窗口规则）：open 记录监控，完结 30m bar 下穿时——
+# 浮亏（现价 < 进场价）→ 推送「Fisher失效」卖出预警，failed=是 closed；
+# 浮盈 → 继续持有等 60m 下穿（持仓 down 扫描挂钩记 failed=否 closed）。
+# HSSR 口径不变：failed=亏损卖出，成功=60m 下穿正常离场。
+ESI_COLUMNS = ["code", "entry_time", "entry_price", "entry_fisher60", "fail_time",
                "fail_fisher30", "failed", "bars_held", "status"]
+ESI_PENDING_COLUMNS = ["code", "name", "signal_time", "bar_time", "fisher60",
+                       "price", "small_tf", "status"]
 
 
 def load_esi_ledger():
@@ -757,6 +834,8 @@ def load_esi_ledger():
     全空列会读成 float64，之后 at/loc 写入中文/时间串会抛 LossySetitemError。"""
     if ESI_LEDGER.exists():
         df = pd.read_csv(ESI_LEDGER, dtype={"code": str})
+        if "entry_price" not in df.columns:   # 旧台账兼容：补列
+            df["entry_price"] = np.nan
         for col in ("entry_time", "fail_time", "failed", "status"):
             if col in df.columns:
                 df[col] = df[col].astype(object).where(df[col].notna(), "")
@@ -769,10 +848,130 @@ def save_esi_ledger(df):
     df.to_csv(ESI_LEDGER, index=False, encoding="utf-8-sig")
 
 
+def load_esi_pending():
+    if ESI_PENDING.exists():
+        df = pd.read_csv(ESI_PENDING, dtype={"code": str})
+        for col in ("signal_time", "bar_time", "small_tf", "status"):
+            if col in df.columns:
+                df[col] = df[col].astype(object).where(df[col].notna(), "")
+        return df
+    return pd.DataFrame(columns=ESI_PENDING_COLUMNS)
+
+
+def save_esi_pending(df):
+    ESI_PENDING.parent.mkdir(exist_ok=True)
+    df.to_csv(ESI_PENDING, index=False, encoding="utf-8-sig")
+
+
+def esi_register_pending(hits):
+    """R1：假性失效信号写入待激活台账（按 code+bar_time 去重）。返回新增条数。"""
+    if hits is None or len(hits) == 0 or "bar_state" not in hits.columns:
+        return 0
+    fake = hits[hits["bar_state"] == "假性失效"]
+    if len(fake) == 0:
+        return 0
+    pen = load_esi_pending()
+    exist = set(zip(pen["code"].astype(str), pen["bar_time"].astype(str)))
+    n = 0
+    for _, r in fake.iterrows():
+        key = (str(r["code"]).zfill(6), str(r["bar_time"]))
+        if key in exist:
+            continue
+        pen = pd.concat([pen, pd.DataFrame([{
+            "code": key[0], "name": r.get("name", ""),
+            "signal_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "bar_time": str(r["bar_time"]), "fisher60": r.get("fisher", ""),
+            "price": r.get("close", ""), "small_tf": r.get("small_tf", ""),
+            "status": "pending",
+        }])], ignore_index=True)
+        exist.add(key)
+        n += 1
+    if n:
+        save_esi_pending(pen)
+        logging.info("ESI 待激活台账新增 %d 条假性失效信号", n)
+    return n
+
+
+def _tf_recovered(df, since):
+    """该周期在 since 之后发生过上穿，且当前处于上行状态（fish > trigger）。"""
+    if df is None or len(df) < MIN_BARS:
+        return None
+    high = pd.to_numeric(df["最高"], errors="coerce").values
+    low = pd.to_numeric(df["最低"], errors="coerce").values
+    fish, trig = fisher_transform(high, low, FISHER_LEN)
+    times = pd.to_datetime(df["时间"])
+    crossed_after = any(just_crossed_up(fish, trig, j)
+                        for j in range(2, len(df)) if times.iloc[j] > since)
+    return bool(crossed_after and fish[-1] > trig[-1])
+
+
+def check_pending_activation(now=None):
+    """R2：待激活台账复查（持仓任务每 15 分钟调用）。
+    三周期全部重新上穿 + 60m fish > trigger → 激活（推送+台账记 open）；
+    60m fish < trigger → void 作废。返回 (激活数, 作废数)。"""
+    now = now or datetime.now()
+    pen = load_esi_pending()
+    todo = pen[pen["status"] == "pending"]
+    if len(todo) == 0:
+        return 0, 0
+    led = load_esi_ledger()
+    open_codes = set(led.loc[led["status"] == "open", "code"].astype(str)) if len(led) else set()
+    activated, voided = [], []
+    pen_changed = led_changed = False
+    for i, rec in todo.iterrows():
+        code = str(rec["code"]).zfill(6)
+        if code in open_codes:                       # 已有 open（其他路径进场），出列
+            pen.at[i, "status"] = "active"
+            pen_changed = True
+            continue
+        df60 = fetch_60m(code)
+        if df60 is None or len(df60) < 3:
+            logging.warning("ESI 激活检查: %s 60m 取数失败，跳过", code)
+            continue
+        h60 = pd.to_numeric(df60["最高"], errors="coerce").values
+        l60 = pd.to_numeric(df60["最低"], errors="coerce").values
+        fish60, trig60 = fisher_transform(h60, l60, FISHER_LEN)
+        if fish60[-1] < trig60[-1]:                  # 60m 趋势已破坏 → 作废
+            pen.at[i, "status"] = "void"
+            pen_changed = True
+            voided.append(code)
+            logging.info("ESI: %s 假性失效信号作废（60m 已下穿）", code)
+            continue
+        since = pd.to_datetime(rec["signal_time"])
+        st = {"30m": fetch_30m(code), "15m": fetch_15m(code), "5m": fetch_5m(code)}
+        states = {k: _tf_recovered(df, since) for k, df in st.items()}
+        if any(v is None for v in states.values()):
+            logging.warning("ESI 激活检查: %s 小周期取数失败，跳过", code)
+            continue
+        if all(states.values()):
+            pen.at[i, "status"] = "active"
+            pen_changed = True
+            led = pd.concat([led, pd.DataFrame([{
+                "code": code, "entry_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "entry_price": float(pd.to_numeric(df60["收盘"], errors="coerce").iloc[-1]),
+                "entry_fisher60": round(float(fish60[-1]), 3),
+                "fail_time": "", "fail_fisher30": "",
+                "failed": "", "bars_held": 0, "status": "open",
+            }])], ignore_index=True)
+            led_changed = True
+            open_codes.add(code)
+            activated.append((code, rec.get("name", "")))
+            logging.info("ESI: %s 信号激活（三周期上穿 + 60m 趋势未破）", code)
+    if pen_changed:
+        save_esi_pending(pen)
+    if led_changed:
+        save_esi_ledger(led)
+    if activated:
+        lines = ["**信号激活（假性失效后小周期重新上穿）**"] + [
+            "%s %s" % (c, n) for c, n in activated]
+        push_text("\n".join(lines))
+    return len(activated), len(voided)
+
+
 def esi_register_entries(hits):
     """持仓 60m 上穿命中的进场登记。返回新登记条数。
 
-    只登记完结 bar（盘中未完结信号不算进场），且 0 < fisher < ESI_ENTRY_FISHER_MAX；
+    只登记完结 bar 且非假性失效（通过 R1 闸门）的信号，0 < fisher < ESI_ENTRY_FISHER_MAX；
     台账已有该 code 的 open 记录、或当日已有 failed 记录（当日禁止重新开仓）则跳过。
     """
     if hits is None or len(hits) == 0:
@@ -798,6 +997,7 @@ def esi_register_entries(hits):
             continue
         led = pd.concat([led, pd.DataFrame([{
             "code": code, "entry_time": str(r["bar_time"]),
+            "entry_price": float(r.get("close", np.nan)),
             "entry_fisher60": round(fisher, 3),
             "fail_time": "", "fail_fisher30": "",
             "failed": "", "bars_held": 0, "status": "open",
@@ -811,13 +1011,11 @@ def esi_register_entries(hits):
 
 
 def esi_check_invalidation(now=None):
-    """ESI 失效判定（30m 收盘后由 run_scan --holdings 门控调用）。
+    """R3 持仓失效卖出（30m 收盘后由 run_scan --holdings 门控调用）。
 
-    台账无 open 记录直接返回空表（零取数）。每条 open 记录：
-    fetch_30m 后按 bar_time > entry_time 计数已完结 30m bar；
-    超过 6 根 → 记成功 closed（failed=否, bars_held=6）；
-    窗口内判最后一根完结 30m bar just_crossed_down，命中再 fetch_60m 比较最新 bar
-    （允许未完结）fisher > 0 且 < 前一根 → 记 failed=是 closed，收集进结果推送。
+    每条 open 记录：最新完结 30m bar 下穿时查浮盈亏——
+    浮亏（该 30m 收盘 < 进场价）→ 记 failed=是 closed，收集推送「Fisher失效」卖出预警；
+    浮盈 → 不动（继续持有等 60m 下穿）。进场价缺失（旧台账）用进场 bar 的 60m 收盘回填。
     返回失效命中 DataFrame（带 attrs，风格同 scan）。
     """
     now = now or datetime.now()
@@ -843,42 +1041,24 @@ def esi_check_invalidation(now=None):
         done = [k for k in range(len(df))
                 if entry_time < times.iloc[k] <= now]   # 进场后已完结的 30m bar
         bars_held = len(done)
-        if bars_held > ESI_WINDOW_BARS:                  # 窗口存活：记成功
-            led.at[i, "bars_held"] = ESI_WINDOW_BARS
-            led.at[i, "failed"] = "否"
-            led.at[i, "status"] = "closed"
-            changed = True
-            logging.info("ESI: %s 窗口存活满 %d 根 30m bar，记成功", code, ESI_WINDOW_BARS)
+        if bars_held == 0:
             continue
         led.at[i, "bars_held"] = bars_held
         changed = True
-        if bars_held == 0:
-            continue
         high = pd.to_numeric(df["最高"], errors="coerce").values
         low = pd.to_numeric(df["最低"], errors="coerce").values
         fish, trig = fisher_transform(high, low, FISHER_LEN)
         j = done[-1]                                     # 最后一根完结 30m bar
         if not just_crossed_down(fish, trig, j):
-            if bars_held == ESI_WINDOW_BARS:             # 第 6 根也未失效：记成功
-                led.at[i, "failed"] = "否"
-                led.at[i, "status"] = "closed"
-                logging.info("ESI: %s 窗口存活满 %d 根 30m bar，记成功", code, ESI_WINDOW_BARS)
             continue
-        df60 = fetch_60m(code)                           # 大周期确认：未死但环比降低
-        time.sleep(REQUEST_INTERVAL)
-        if df60 is None or len(df60) < 3:
-            logging.warning("ESI: %s 60m 取数失败，本次跳过判定", code)
-            continue
-        h60 = pd.to_numeric(df60["最高"], errors="coerce").values
-        l60 = pd.to_numeric(df60["最低"], errors="coerce").values
-        fish60, _ = fisher_transform(h60, l60, FISHER_LEN)
-        cur, prev = fish60[-1], fish60[-2]               # 最新 bar 允许未完结，取当前值
-        if not (cur > 0 and cur < prev):
-            if bars_held == ESI_WINDOW_BARS:
-                led.at[i, "failed"] = "否"
-                led.at[i, "status"] = "closed"
-                logging.info("ESI: %s 窗口存活满 %d 根 30m bar，记成功", code, ESI_WINDOW_BARS)
-            continue
+        price_now = float(pd.to_numeric(df["收盘"], errors="coerce").iloc[j])
+        entry_price = rec.get("entry_price")
+        if entry_price is None or pd.isna(entry_price):
+            entry_price = price_now                      # 旧台账无进场价：按不亏处理（跳过卖出）
+            led.at[i, "entry_price"] = entry_price
+            logging.warning("ESI: %s 旧台账缺进场价，已回填为当前价（不会再因浮亏触发）", code)
+        if price_now >= entry_price:
+            continue                                     # 浮盈：继续持有等 60m 下穿
         led.at[i, "fail_time"] = str(df["时间"].iloc[j])
         led.at[i, "fail_fisher30"] = round(float(fish[j]), 3)
         led.at[i, "failed"] = "是"
@@ -887,19 +1067,38 @@ def esi_check_invalidation(now=None):
         hits.append({
             "code": code, "name": names.get(code, ""),
             "bar_time": str(df["时间"].iloc[j]),
-            "close": float(pd.to_numeric(df["收盘"], errors="coerce").iloc[j]),
+            "close": price_now,
             "fisher": round(float(fish[j]), 3),
             "trigger": round(float(trig[j]), 3),
             "bar_state": "失效",
         })
-        logging.info("ESI: %s Fisher-Fail（30m 下穿 @%s，60m fisher %.3f→%.3f）",
-                     code, df["时间"].iloc[j], prev, cur)
+        logging.info("ESI: %s 失效卖出（30m 下穿 @%s，现价 %.2f < 进场 %.2f）",
+                     code, df["时间"].iloc[j], price_now, entry_price)
     if changed:
         save_esi_ledger(led)
     result = pd.DataFrame(hits)
     result.attrs["total"] = len(opens)
     result.attrs["fails"] = 0
     return result
+
+
+def esi_close_on_60m_down(hits):
+    """持仓 60m 下穿命中时挂钩：对应 open 台账记录记正常离场（failed=否 closed）。
+    由 run_scan --holdings 的下穿扫描后调用。返回关闭条数。"""
+    if hits is None or len(hits) == 0:
+        return 0
+    led = load_esi_ledger()
+    if len(led) == 0:
+        return 0
+    codes = set(str(c).zfill(6) for c in hits["code"])
+    mask = (led["status"] == "open") & led["code"].astype(str).isin(codes)
+    n = int(mask.sum())
+    if n:
+        led.loc[mask, "failed"] = "否"
+        led.loc[mask, "status"] = "closed"
+        save_esi_ledger(led)
+        logging.info("ESI 台账：%d 条 open 记录随 60m 下穿记正常离场", n)
+    return n
 
 
 def hssr_report(now=None):
@@ -1396,8 +1595,10 @@ def main():
         if len(pool) == 0:
             logging.info("股票池为空，跳过扫描")
             return
-        notify(scan(pool, label=pool_tag(args), side=args.side, source=source, live=args.live),
-               pool_label(args), side=args.side)
+        result = scan(pool, label=pool_tag(args), side=args.side, source=source, live=args.live)
+        if args.side == "up":
+            esi_register_pending(result)   # R1：假性失效信号入待激活台账
+        notify(result, pool_label(args), side=args.side)
 
 
 if __name__ == "__main__":

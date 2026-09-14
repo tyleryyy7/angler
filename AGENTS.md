@@ -64,17 +64,21 @@
   推送 pond=深水日共振（bar_state=日共振），结果写 results/fisher_cross_*_deepres.csv
 - 持仓：60 分钟 Fisher 下穿预警，无命中不推送
 
-**Fisher-ESI 早期失效规则（持仓版）**：台账 cache/esi_ledger.csv。
-- 进场登记：持仓票**完结** 60m bar Fisher 上穿 且 0 < fisher < 2.5 → 记 open；
-  已有 open 记录或当日已有 failed 记录（当日禁止重新开仓）则跳过（`esi_register_entries`，
-  由 run_scan --holdings 上穿扫描后自动调用）。
-- 失效判定：自进场 bar 起 6 根完结 30m bar 窗口（3 交易小时）内，同时满足
-  ① 完结 30m bar Fisher 下穿 Trigger；② 最新 60m bar（允许未完结，取当前值）
-  fisher > 0 且 < 前一根（大周期未死但环比降低）→ Fisher-Fail，记 failed=是 closed，
-  推送 pond=Fisher失效（side=down）平仓预警（`esi_check_invalidation`，
-  仅在 30m 收盘后窗口 10:01-10:15/10:31-10:45/…/15:01-15:15 跑，门控在 run_scan --holdings 分支）。
-- 窗口存活满 6 根未失效 → 记成功 closed（failed=否，bars_held=6）。
-- HSSR 周报：按 code 取最近 20 条 closed 记录，HSSR = 未失效数/总数，附平均失效分钟数，
+**Fisher-ESI 规则 v2（2026-09-14 重写，旧 6 根窗口规则废弃）**：台账 cache/esi_ledger.csv
+（+entry_price 列），待激活台账 cache/esi_pending.csv。
+- R1 进场过滤（所有买入信号，各池通用）：60m 上穿命中时检查 30m/15m/5m，任一周期
+  处于下行段（fish < trigger）→ bar_state=假性失效，推送标注「待激活」并写入
+  esi_pending（`esi_register_pending`，--once 与 run_scan 都挂钩）。
+- R2 信号激活：pending 票由持仓任务每 15 分钟复查（`check_pending_activation`）：
+  三周期在信号后都重新上穿过且当前 fish > trigger，且 60m fish > trigger（趋势未破坏）
+  → 推送「信号激活」并台账记 open（entry_time=激活时刻）；60m fish < trigger → void 作废。
+- 进场登记（`esi_register_entries`）：完结且非假性失效的持仓上穿信号，0 < fisher < 2.5
+  → 记 open；已有 open 或当日 failed 跳过（当日禁止重新开仓）。
+- R3 持仓失效卖出（`esi_check_invalidation`，30m 收盘后窗口门控不变）：open 记录
+  在完结 30m bar 下穿时——浮亏（现价 < entry_price）→ 推送 pond=Fisher失效 卖出预警，
+  failed=是 closed；浮盈 → 继续持有。60m 下穿正常离场由持仓 down 扫描挂钩
+  `esi_close_on_60m_down` 记 failed=否 closed。
+- HSSR 周报口径不变：按 code 取最近 20 条 closed，HSSR = 未失效数/总数（failed=否占比），
   每周日 20:00 推送（`hssr_report`，run_scan --hssr-report，在周末保护之前豁免）。
 
 信号：fish2 = fish1[1]，上穿 = Fisher 由跌转升拐点。默认只判最新已完结 60 分钟 bar；
