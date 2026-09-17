@@ -48,21 +48,20 @@
   2026-09-15 起全池约 400 只跑模拟盘）。sim_pos.csv 列为 code,vol,cost,buy_date，
   当日买入的股票（非 T0）禁止当日卖出（T+1），实盘卖出量取 m_nCanUseVolume。
 - `build_qmt_watchlist.py` — 生成 QMT 执行器 watchlist（`.venv` 运行）。
-- `build_ths_block.py` — 建池后把五池覆盖同步到同花顺自定义板块（`.venv` 运行，
-  已挂 build_pool.cmd 末尾）。板块映射按**名字**运行时反查 ID（客户端重建板块会变 ID，
-  2026-09-17 定版）：_ALL 后缀=完整池（右侧鱼塘_ALL←pool_right、左侧鱼塘_ALL←pool_left、
+- `build_ths_block.py` — 建池后生成同花顺板块导入文件 `ths_blocks/<板块名>.txt`
+  （GBK，每行"代码 名称"；`.venv` 运行，已挂 build_pool.cmd 末尾）。10 个板块：
+  _ALL 后缀=完整池（右侧鱼塘_ALL←pool_right、左侧鱼塘_ALL←pool_left、
   深水池_ALL←pool_deep、T0_ALL←pool_t0、T1_ALL←pool_t1）；无后缀=盘后候选
   （右侧鱼塘、左侧鱼塘、深水池、T0、T1 ← results/candidates_最新.csv 按池分流，
-  「日K上穿」合并名单按代码所属池归入）。板块名须与客户端完全一致，找不到会跳过告警。
-  **板块名单以客户端云同步为准：本地写入的名称条目会被客户端启动时清掉，
-  新建/改名板块必须在客户端里操作，且板块里至少要有一只票**（空板块不上云，
-  2026-09-17 实测被清）；已有板块的内容可以本地写。同花顺板块两处存储
-  （C:\同花顺软件\同花顺\mo_<uid>\，自动探测）：stockblock.ini
-  （GBK，NAME_MAP_TABLE + BLOCK_STOCK_CONTEXT 行 `HEXID=mkt:code,...,,`）+
-  custom_block/<十进制ID>（JSON `{"context":"code|...|,mkt|...|","ln":"","xn":""}`，
-  ln 空串客户端已接受）。市场代码：17=沪股票(60/68) 33=深股票(00/30)
-  20=沪ETF(51/58) 36=深ETF(15)。**hexin.exe 运行时会覆盖板块文件**：脚本顶部
-  AUTO_CLOSE/RELAUNCH=True，自动关客户端→写入→重开；写前每天备份 .bak_YYYYMMDD。
+  「日K上穿」合并名单按代码所属池归入）。**用户每天收盘后在客户端手动导入**
+  （自定义板块设置 → 选板块 → 导入；导入动作触发上传，PC/手机双端一致持久）。
+  **为何放弃离线写文件**（2026-09-17 调查，Logger\CustomBlock 日志实证）：
+  板块权威名单在云端（账号+版本号 v465），离线写本地文件永不上云；任何设备改动板块
+  → 版本 bump → PC 每 5 分钟轮询到后全量下载覆盖本地（离线内容+未上云板块全抹掉）。
+  上传只发生在 UI 操作路径（新建/导入/编辑）。新建/改名板块只能在客户端做，
+  且板块里至少要有一只票（空板块不上云）；同名板块 add 报 -703。
+  本地镜像文件（调查备查）：stockblock.ini（GBK，NAME_MAP/CONTEXT）、
+  custom_block\<十进制ID>（JSON，ln=混淆板块名）、custom_block\0（sortstr 可见性清单）。
 - `tick_bar_builder.py` — 快照驱动实时 bar 聚合器（第二阶段）。git 主版本在项目根，
   部署副本 D:\tdx\PYPlugins\user\tick_bar_builder.py（TQ UserPY 策略「随终端运行」常驻），
   机制详见「数据通道」段 tdxq 条目。

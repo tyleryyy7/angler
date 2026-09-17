@@ -25,3 +25,6 @@ qmt-live/
 watchlist_t0_top50.csv
 
 .build_lock/
+
+# 同花顺板块导入文件（每日生成）
+ths_blocks/
