@@ -48,6 +48,15 @@
   2026-09-15 起全池约 400 只跑模拟盘）。sim_pos.csv 列为 code,vol,cost,buy_date，
   当日买入的股票（非 T0）禁止当日卖出（T+1），实盘卖出量取 m_nCanUseVolume。
 - `build_qmt_watchlist.py` — 生成 QMT 执行器 watchlist（`.venv` 运行）。
+- `build_ths_block.py` — 建池后把五池覆盖同步到同花顺自定义板块（`.venv` 运行，
+  已挂 build_pool.cmd 末尾）：右侧鱼塘(14C)/左侧鱼塘(14B)/深水池(146)/T0(28)/T1鱼塘(14D 新建)。
+  同花顺板块两处存储（C:\同花顺软件\同花顺\mo_<uid>\，自动探测）：stockblock.ini
+  （GBK，NAME_MAP_TABLE + BLOCK_STOCK_CONTEXT 行 `HEXID=mkt:code,...,,`）+
+  custom_block/<十进制ID>（JSON `{"context":"code|...|,mkt|...|","ln":"","xn":""}`）。
+  市场代码：17=沪股票(60/68) 33=深股票(00/30) 20=沪ETF(51/58) 36=深ETF(15)。
+  **hexin.exe 运行时写入无效（客户端退出覆盖文件），脚本检测到会直接跳过**；
+  写前每天备份 .bak_YYYYMMDD。`ln` 校验串算法未知，先写空串，首次同步后需
+  开客户端验证板块内容是否被接受/被云同步冲掉。
 - `tick_bar_builder.py` — 快照驱动实时 bar 聚合器（第二阶段）。git 主版本在项目根，
   部署副本 D:\tdx\PYPlugins\user\tick_bar_builder.py（TQ UserPY 策略「随终端运行」常驻），
   机制详见「数据通道」段 tdxq 条目。
