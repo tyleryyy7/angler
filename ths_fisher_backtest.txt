@@ -1,0 +1,26 @@
+{ Fisher-ESI 60分钟 同花顺回测公式（交易系统类型）
+  与 fisher_scanner.py 口径逐行对应：
+    hl2=(HIGH+LOW)/2；窗口9；v=0.66*((hl2-ll)/(hh-ll)-0.5)+0.67*REF(v,1)，±0.999 截断
+    fish=0.5*LN((1+v)/(1-v))+0.5*REF(fish,1)；trigger=REF(fish,1)
+  上穿 = fisher 由跌转升拐点：fish>REF(fish,1) 且 REF(fish,1)<=REF(fish,2)
+  进场过滤（ESI 登记口径）：0 < fish < 2.5
+  离场：fisher 由升转跌拐点（60m 下穿，即扫描器持仓 down 监控的正常离场）
+  注意：ESI 的 R1/R2（30m/15m/5m 假性失效与激活）、R3（30m 失效卖出）为多周期规则，
+  同花顺回测单周期无法表达，回测结果会比实盘偏乐观，解读时注意。
+  用法：同花顺 → 公式管理器 → 新建「交易系统」→ 粘贴 → 回测时周期选 60 分钟。 }
+
+N:=9;
+HL2:=(HIGH+LOW)/2;
+HH:=HHV(HL2,N);
+LL:=LLV(HL2,N);
+DIV:=IF(HH=LL,0.0001,HH-LL);
+V:=MIN(MAX(0.66*((HL2-LL)/DIV-0.5)+0.67*REF(V,1),-0.999),0.999);
+FISH:=0.5*LN((1+V)/(1-V))+0.5*REF(FISH,1);
+
+CROSS_UP:=FISH>REF(FISH,1) AND REF(FISH,1)<=REF(FISH,2);
+CROSS_DN:=FISH<REF(FISH,1) AND REF(FISH,1)>=REF(FISH,2);
+
+BUYOK:=CROSS_UP AND FISH>0 AND FISH<2.5;
+
+ENTERLONG: BUYOK;
+EXITLONG: CROSS_DN;

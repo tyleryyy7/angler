@@ -6,7 +6,8 @@
     的日线 fisher 判定（池子每晚 00:00 用已完结日 K 重建，当天盘中用的是昨收盘口径）。
   Trigger（60m）：完结 60m bar 费雪上穿（fish 上穿 trigger = 由跌转升拐点）。
   进场闸门（可选）：0 < fisher60 < 2.5（ESI 进场条件）。
-  离场（先到先出）：
+  离场（先到先出；A 股 T+1：进场当日触发的离场递延到次日首根完结 60m bar 成交，
+    reason 带 (T+1) 标记）：
     a) ESI 失效：进场后 6 根完结 30m bar 窗口内，完结 30m bar 费雪下穿
        且当时 60m fisher > 0 且 < 前一根 → 平仓；
     b) 6 根窗口存活 → 之后持有直到完结 60m bar 下穿。
@@ -63,7 +64,8 @@ def main():
 
     trades = []
     pos = 0
-    entry_i = entry_time = entry_fish = None
+    entry_i = entry_time = entry_fish = entry_date = None
+    deferred = None          # T+1: 当日触发的离场原因，次日首根 60m bar 执行
 
     for j in range(2, len(df60)):
         bar_time = df60["时间"].iloc[j]
@@ -75,12 +77,28 @@ def main():
                     continue
                 pos = 1
                 entry_i, entry_time, entry_fish = j, bar_time, f60[j]
+                entry_date = bar_time.date()
                 trades.append({"side": "BUY", "time": bar_time,
                                "price": float(df60["收盘"].iloc[j]),
                                "fish": round(float(f60[j]), 3), "reason": "上穿"})
         else:
+            # T+1 递延执行：次日第一根完结 60m bar 收盘价成交
+            #（跳空未单独建模，用首根 bar 收盘近似）
+            if deferred is not None and bar_time.date() != entry_date:
+                trades.append({"side": "SELL", "time": bar_time,
+                               "price": float(df60["收盘"].iloc[j]),
+                               "fish": round(float(f60[j]), 3),
+                               "reason": deferred + "(T+1)"})
+                pos = 0
+                deferred = None
+                continue
+            same_day = bar_time.date() == entry_date
             # b) 60m 下穿离场
             if fs.just_crossed_down(f60, t60, j):
+                if same_day:
+                    if deferred is None:
+                        deferred = "60m下穿"   # 当日卖不掉，递延到次日
+                    continue
                 trades.append({"side": "SELL", "time": bar_time,
                                "price": float(df60["收盘"].iloc[j]),
                                "fish": round(float(f60[j]), 3), "reason": "60m下穿"})
@@ -101,6 +119,10 @@ def main():
                 ll = list(df60["最低"].astype(float).values[mask60])
                 f_now, _ = fisher(hh, ll)
                 if len(f_now) >= 2 and 0 < f_now[-1] < f_now[-2]:
+                    if pd.Timestamp(t30_times[k]).date() == entry_date:
+                        if deferred is None:
+                            deferred = "ESI失效"   # 当日卖不掉，递延到次日
+                        break
                     trades.append({"side": "SELL", "time": pd.Timestamp(t30_times[k]),
                                    "price": float(df30["收盘"].iloc[k]),
                                    "fish": round(float(f60[j]), 3), "reason": "ESI失效"})
@@ -128,6 +150,8 @@ def main():
     print("期末持仓: %s" % ("有" if pos else "无"))
     esi = [t for t in trades if t.get("reason") == "ESI失效"]
     print("ESI 失效离场次数: %d" % len(esi))
+    t1 = [t for t in trades if "(T+1)" in str(t.get("reason"))]
+    print("T+1 递延离场笔数: %d" % len(t1))
 
 
 if __name__ == "__main__":

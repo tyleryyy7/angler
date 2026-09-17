@@ -10,7 +10,7 @@ Fisher Transform 60分钟线「刚上穿」扫描器（沪深A股，akshare；�
 
 A股 60 分钟 bar 一天 4 根，东财时间戳为 bar 结束时刻：10:30 / 11:30 / 14:00 / 15:00。
 完结信号建议在每根 bar 收盘后 1 分钟运行：10:31 / 11:31 / 14:01 / 15:01；
-盘中（--live）信号在 bar 中段运行（10:01 / 11:01 / 13:31 / 14:31，对应 9:30-10:30 / 10:30-11:30 / 13:00-14:00 / 14:00-15:00 四根 bar 的中点），持仓每 15 分钟。
+盘中（--live）信号在 bar 中段运行（10:01 / 11:01 / 13:31 / 14:31，对应 9:30-10:30 / 10:30-11:30 / 13:00-14:00 / 14:00-15:00 四根 bar 的中点），持仓每 5 分钟。
 
 用法：
     python fisher_scanner.py --once                      # 扫一次退出（配合 cron / 任务计划）
@@ -25,6 +25,7 @@ A股 60 分钟 bar 一天 4 根，东财时间戳为 bar 结束时刻：10:30 / 
 import argparse
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime, timedelta
@@ -37,7 +38,8 @@ import pandas as pd
 DATA_SOURCE = "tdxq"      # 数据源："tdxq"（默认，通达信客户端 TQ，须客户端登录）/ "sina" / "em"（本机被封）
 FISHER_LEN = 9            # Fisher 窗口长度，与 Pine/同花顺参数一致
 MIN_BARS = 80             # 60分钟bar少于此数视为暖机不足，跳过（次新股、长期停牌）
-REQUEST_INTERVAL = 0.25   # 每个 worker 每只股票之间的请求间隔（秒），防限流
+REQUEST_INTERVAL = 0.8    # sina 请求间隔基准（秒），加 ±0.2s 抖动防规律性指纹（2026-09-15 起温柔模式）
+_SINA_BACKOFF = 0         # 限流退避秒数：HTTP 456 时指数增长（30/60/120...封顶300），成功后清零
 WORKERS = 4               # 并发进程数；新浪源建议 <=4（约 4~5 次请求/秒，实测安全），东财源可到 8
 RETRY = 3                 # 单只票拉取失败重试次数
 EXCLUDE_ST = True         # 排除 ST / *ST / 退市整理股
@@ -58,7 +60,7 @@ ESI_LEDGER = Path(__file__).resolve().parent / "cache" / "esi_ledger.csv"  # Fis
 ESI_PENDING = Path(__file__).resolve().parent / "cache" / "esi_pending.csv"  # 假性失效待激活台账
 ESI_WINDOW_BARS = 6           # 已废弃（旧失效窗口规则，2026-09-14 重写后不再使用）
 ESI_ENTRY_FISHER_MAX = 2.5    # 进场登记：上穿时 60m fisher 上限
-# 30m bar 收盘后判定窗口（每 15 分钟持仓任务网格上）：当前时刻落在区间内才跑失效判定
+# 30m bar 收盘后判定窗口（每 5 分钟持仓任务网格上）：当前时刻落在区间内才跑失效判定
 ESI_JUDGE_WINDOWS = [("10:01", "10:15"), ("10:31", "10:45"), ("11:01", "11:15"),
                      ("11:31", "11:45"), ("13:31", "13:45"), ("14:01", "14:15"),
                      ("14:31", "14:45"), ("15:01", "15:15")]
@@ -190,6 +192,10 @@ def _fetch_min_sina(code, scale):
     r = requests.get(SINA_KLINE_URL,
                      params={"symbol": symbol, "scale": scale, "ma": "no", "datalen": 1970},
                      headers=SINA_HEADERS, timeout=15)
+    if r.status_code == 456:
+        _sina_penalize()
+        return None
+    _sina_relax()
     data = json.loads(r.text[r.text.index("["):r.text.rindex("]") + 1])
     if not data:
         return None
@@ -210,6 +216,23 @@ def _fetch_60m_sina(code):
 
 def _fetch_30m_sina(code):
     return _fetch_min_sina(code, 30)
+
+
+def _throttle():
+    """sina 温柔限速：基准间隔 + ±0.2s 抖动 + 限流退避。"""
+    time.sleep(max(0.2, REQUEST_INTERVAL + random.uniform(-0.2, 0.2)) + _SINA_BACKOFF)
+
+
+def _sina_penalize():
+    """HTTP 456 限流：指数退避 30/60/120... 封顶 300s。"""
+    global _SINA_BACKOFF
+    _SINA_BACKOFF = 30 if _SINA_BACKOFF == 0 else min(300, _SINA_BACKOFF * 2)
+    logging.warning("sina 限流（HTTP 456），请求退避 %ds", _SINA_BACKOFF)
+
+
+def _sina_relax():
+    global _SINA_BACKOFF
+    _SINA_BACKOFF = 0
 
 
 # ---------------- tdxq：官方通达信客户端 TQ 接口 ----------------
@@ -245,6 +268,76 @@ def _tdxq_fresh(last_bar, now):
     return True
 
 
+def tdxq_has_today_close(now=None):
+    """最近一个交易日的 15:00 完结 bar 是否已在缓存中（盘后候选扫描用）。
+    开盘前（含 00:00 建池后）目标 bar 视为上一交易日 15:00。"""
+    now = now or datetime.now()
+    d = now
+    if now.strftime("%H:%M") < "09:35":
+        d = now - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    target = d.replace(hour=15, minute=0, second=0, microsecond=0)
+    files = sorted(TDXQ_CACHE_DIR.glob("*_1h.csv"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    latest = None
+    for p in files:
+        try:
+            df = pd.read_csv(p)
+            col = "时间" if "时间" in df.columns else "time"
+            t = pd.to_datetime(df[col].iloc[-1]).to_pydatetime()
+            if latest is None or t > latest:
+                latest = t
+        except Exception:
+            continue
+    ok = latest is not None and latest >= target
+    if not ok:
+        logging.info("tdxq 无当日 15:00 完结 bar（最新 %s）",
+                     latest.strftime("%m-%d %H:%M") if latest else "无缓存")
+    return ok
+
+
+def tdxq_fresh_enough(now=None):
+    """整链新鲜度校验：盘中最新 1h bar 落后于「应有最新完结 bar」超过 5 分钟
+    视为陈旧（TQ K 线是静态库，官方确认盘中仅日K，陈旧数据等于盲扫）。
+    非交易日、非盘中时段不校验。run_scan 每轮调用，陈旧则整链降级 sina。"""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return True
+    hm = now.strftime("%H:%M")
+    if hm < "09:35" or hm > "15:05":
+        return True
+    expected = None
+    for c in ("10:30", "11:30", "14:00", "15:00"):
+        t = now.replace(hour=int(c[:2]), minute=int(c[3:]), second=0, microsecond=0)
+        if t <= now:
+            expected = t
+    if expected is None:   # 10:30 前：最新应是上一交易日 15:00
+        d = now - timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        expected = d.replace(hour=15, minute=0, second=0, microsecond=0)
+    latest = None
+    files = sorted(TDXQ_CACHE_DIR.glob("*_1h.csv"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    for p in files:
+        try:
+            df = pd.read_csv(p)
+            col = "时间" if "时间" in df.columns else "time"
+            t = pd.to_datetime(df[col].iloc[-1]).to_pydatetime()
+            if latest is None or t > latest:
+                latest = t
+        except Exception:
+            continue
+    if latest is None:
+        return False
+    if latest < expected - timedelta(minutes=5):
+        logging.info("tdxq 分钟数据陈旧：最新 bar %s，应有 %s，降级 sina",
+                     latest.strftime("%m-%d %H:%M"), expected.strftime("%m-%d %H:%M"))
+        return False
+    return True
+
+
 def _fetch_tdxq(code, period, count):
     """读 tdxq 缓存 CSV；缺失/过期时单票按需补取（子进程约几秒）。
     bar 时间即收盘时刻（10:30/11:30/14:00/15:00），与现有约定一致，无需映射。"""
@@ -262,6 +355,11 @@ def _fetch_tdxq(code, period, count):
         if not path.exists():
             return None
         df = pd.read_csv(path)
+        # TQ 分钟线盘中是静态库，补取可能仍停在昨日收盘；不新鲜则视为取数失败，
+        # 避免用昨日数据做盘中判定（2026-09-17 ESI 假激活事故）。
+        if len(df) == 0 or not _tdxq_fresh(
+                pd.to_datetime(df["时间"].iloc[-1]) if "时间" in df else pd.to_datetime(df["time"].iloc[-1]), now):
+            return None
     df = df.rename(columns={"time": "时间", "high": "最高", "low": "最低", "close": "收盘"})
     df["时间"] = pd.to_datetime(df["时间"])
     for col in ("最高", "最低", "收盘"):
@@ -371,7 +469,7 @@ def small_tf_state(code, source=None):
     for label, fn in (("30m", fetch_30m), ("15m", fetch_15m), ("5m", fetch_5m)):
         df = fn(code, source)
         if source != "tdxq":
-            time.sleep(REQUEST_INTERVAL)
+            _throttle()
         if df is None or len(df) < MIN_BARS:
             logging.warning("小周期状态: %s %s 取数失败/不足", code, label)
             out[label] = None
@@ -425,7 +523,7 @@ def scan_one(row, side="up", source=None, live=False):
     code, name = str(row["code"]), row["name"]
     df = fetch_60m(code, source)
     if source != "tdxq":
-        time.sleep(REQUEST_INTERVAL)   # 每个 worker 内部的节流（tdxq 是本地读，不用）
+        _throttle()   # 每个 worker 内部的节流（tdxq 是本地读，不用）
     if df is None:
         return "FAIL"
     if len(df) < MIN_BARS:
@@ -498,8 +596,9 @@ def scan(pool, save=True, label="", side="up", source=None, live=False):
     result = pd.DataFrame(hits)
     if len(result):
         if "score" in pool.columns:   # 带打分的池（如深水池）：附分数并按分数降序
-            merge_cols = ["code", "score"] + [c for c in ("hssr", "hssr_n")
-                                              if c in pool.columns]
+            merge_cols = ["code", "score"] + [c for c in (
+                "hssr", "hssr_n", "avg_amount", "avg_amplitude")
+                if c in pool.columns]
             result = result.merge(pool[merge_cols], on="code", how="left")
             result = result.sort_values("score", ascending=False).reset_index(drop=True)
         else:
@@ -537,7 +636,7 @@ def daily_crossed_up(code):
     """当日已完结日 K 是否刚完成 Fisher 上穿（fisher_transform + just_crossed_up 判最后一根）。
     取数失败返回 False 并 log warning。"""
     df = fetch_daily_sina(code)
-    time.sleep(REQUEST_INTERVAL)   # 新浪限速
+    _throttle()   # 新浪限速
     if df is None:
         logging.warning("%s 日线数据不足，按未上穿处理", code)
         return False
@@ -552,7 +651,7 @@ def scan_one_deep_resonance(row, source=None):
     命中返回 dict；不满足返回 'SKIP'；60m 取数失败返回 'FAIL'。"""
     code, name = str(row["code"]), row["name"]
     df = fetch_60m(code, source)
-    time.sleep(REQUEST_INTERVAL)
+    _throttle()
     if df is None:
         return "FAIL"
     if len(df) < MIN_BARS:
@@ -746,29 +845,60 @@ def notify(result, pond="鱼塘", side="up"):
             "（含假性失效，待小周期激活）" if has_fake else "")
 
         def _row_text(r):
-            tag = ("（假性失效，待激活 %s）" % r.get("small_tf", "")
-                   ) if r.get("bar_state") == "假性失效" else (
-                "（未完结）" if r.get("bar_state") == "未完结" else "")
-            if "score" in result.columns:   # 带打分的池附分数
-                text = "%s %s（%s）%s" % (r["code"], r["name"], r["score"], tag)
-                if "hssr" in result.columns:   # 深水池 HSSR 档位（建池时预计算）
-                    h, n_sig = r.get("hssr"), r.get("hssr_n")
-                    if h is None or pd.isna(h) or n_sig is None or pd.isna(n_sig):
-                        text += " HSSR 样本不足 (n<5)"
-                    else:
-                        h, n_sig = float(h), int(n_sig)
-                        wins = int(round(h * n_sig / 100))
-                        tier = "正常仓位" if h >= 75 else ("仓位减半" if h >= 50 else "不建议买入")
-                        text += " HSSR %.0f%% (%d/%d) · %s" % (h, wins, n_sig, tier)
-                return text
-            return "%s %s%s" % (r["code"], r["name"], tag)
+            # 排版：每票最多三行短句（代码名加粗作锚点），企微折行后不再粘成一片
+            line1 = "**%s %s**" % (r["code"], r["name"])
+            if "close" in result.columns and pd.notna(r.get("close")):
+                line1 += " %.2f" % float(r["close"])
+            if "chg" in result.columns and pd.notna(r.get("chg")):
+                line1 += " %+.1f%%" % float(r["chg"])
+            seg2 = []
+            if "avg_amount" in result.columns and pd.notna(r.get("avg_amount")):
+                seg2.append("额%.1f亿" % float(r["avg_amount"]))
+            if "avg_amplitude" in result.columns and pd.notna(r.get("avg_amplitude")):
+                seg2.append("振%.1f%%" % float(r["avg_amplitude"]))
+            if "fisher" in result.columns and pd.notna(r.get("fisher")):
+                sig = "F%.2f/%.2f" % (float(r["fisher"]), float(r["trigger"]))
+                state = r.get("bar_state") or ""
+                if state == "假性失效":
+                    sig += " 假性失效·待激活"
+                elif state:
+                    sig += " %s" % state
+                if r.get("small_tf"):
+                    sig += "(%s)" % r["small_tf"]
+                seg2.append(sig)
+            seg3 = []
+            if "score" in result.columns and pd.notna(r.get("score")):
+                seg3.append("分%s" % r["score"])
+            if "hssr" in result.columns:   # 深水池 HSSR 档位（建池时预计算）
+                h, n_sig = r.get("hssr"), r.get("hssr_n")
+                if h is None or pd.isna(h) or n_sig is None or pd.isna(n_sig):
+                    seg3.append("HSSR 样本不足 (n<5)")
+                else:
+                    h, n_sig = float(h), int(n_sig)
+                    wins = int(round(h * n_sig / 100))
+                    tier = "正常仓位" if h >= 75 else ("仓位减半" if h >= 50 else "不建议买入")
+                    seg3.append("HSSR %.0f%% (%d/%d) · %s" % (h, wins, n_sig, tier))
+            if "mcap" in result.columns and pd.notna(r.get("mcap")):
+                seg3.append("市值%.0f亿" % float(r["mcap"]))
+            if "pos_pct" in result.columns and pd.notna(r.get("pos_pct")):
+                seg3.append("位置%.0f%%" % float(r["pos_pct"]))
+            if "pe" in result.columns and pd.notna(r.get("pe")):
+                seg3.append("PE%.0f" % float(r["pe"]))
+            lines = [line1]
+            if seg2:
+                lines.append(" | ".join(seg2))
+            if seg3:
+                lines.append(" | ".join(seg3))
+            return "\n".join(lines)
 
-        lines = [title] + [_row_text(r) for _, r in result.head(PUSH_MAX_ROWS).iterrows()]
+        rows = [_row_text(r) for _, r in result.head(PUSH_MAX_ROWS).iterrows()]
         if len(result) > PUSH_MAX_ROWS:
-            lines.append("……共 %d 只，完整清单见 results CSV" % len(result))
-        content = "\n".join(lines)
+            rows.append("……共 %d 只，完整清单见 results CSV" % len(result))
+        content = title + "\n" + "\n\n".join(rows)   # 空行只隔票，标题紧贴
         should_push = True
     pending_keys = keys if (should_push and len(result)) else None
+    while len(content.encode("utf-8")) > 3800:   # 企业微信 markdown 上限 4096 字节
+        content = content.rsplit("\n", 1)[0]     # 逐行截尾，防中文截断乱码
     if WECOM_WEBHOOK and should_push:
         try:
             import requests
@@ -815,7 +945,7 @@ def _save_list(filename, df):
 # ---------------- Fisher-ESI 规则 v2（2026-09-14 重写） ----------------
 # R1 进场过滤（所有买入信号）：60m 上穿时，30m/15m/5m 任一小周期处于下行段
 # （fish < trigger）→ 信号记「假性失效」，推送标注并写入待激活台账（esi_pending.csv）。
-# R2 信号激活：pending 票由持仓任务每 15 分钟复查，5m/15m/30m 全部重新上穿过
+# R2 信号激活：pending 票由持仓任务每 5 分钟复查，5m/15m/30m 全部重新上穿过
 # （signal_time 之后出现过上穿且当前 fish > trigger）且 60m fish > trigger
 # → 推送「信号激活」并正式登记 open；60m fish < trigger → 记 void 作废。
 # R3 持仓失效卖出（替换旧窗口规则）：open 记录监控，完结 30m bar 下穿时——
@@ -906,7 +1036,7 @@ def _tf_recovered(df, since):
 
 
 def check_pending_activation(now=None):
-    """R2：待激活台账复查（持仓任务每 15 分钟调用）。
+    """R2：待激活台账复查（持仓任务每 5 分钟调用）。
     三周期全部重新上穿 + 60m fish > trigger → 激活（推送+台账记 open）；
     60m fish < trigger → void 作废。返回 (激活数, 作废数)。"""
     now = now or datetime.now()
@@ -1033,7 +1163,7 @@ def esi_check_invalidation(now=None):
         code = str(rec["code"]).zfill(6)
         entry_time = pd.to_datetime(rec["entry_time"])
         df = fetch_30m(code)
-        time.sleep(REQUEST_INTERVAL)
+        _throttle()
         if df is None or len(df) < MIN_BARS:
             logging.warning("ESI: %s 30m 取数失败/不足，本次跳过判定", code)
             continue

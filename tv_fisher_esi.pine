@@ -1,0 +1,129 @@
+//@version=6
+// ============================================================================
+// Fisher-ESI v2 策略回测（TradingView Pine v6，图表周期请切换到 60 分钟）
+// 与 angler 项目 fisher_scanner.py 的口径逐条对应：
+//   Fisher 计算      -> fisher_transform()        fisher_scanner.py:95
+//   上穿/下穿拐点    -> just_crossed_up/down      fisher_scanner.py:121
+//   R1 假性失效过滤  -> esi_register_pending()    fisher_scanner.py:866
+//   R2 信号激活/作废 -> check_pending_activation() fisher_scanner.py:908
+//   进场登记过滤     -> esi_register_entries()    fisher_scanner.py:971 (0<fisher<2.5, 当日禁重开)
+//   R3 30m失效卖出   -> esi_check_invalidation()  (浮亏才卖)
+//   60m下穿正常离场  -> esi_close_on_60m_down()
+//
+// 已知偏差（回测无法消除，解读时注意）：
+//   1. 小周期状态在 60m bar 收盘时刻取对齐的已完结 30m/15m/5m bar，
+//      实盘 R2/R3 是每 5 分钟复查，时点更密，回测可能晚 1 根 60m bar。
+//   2. 手续费按双边百分比近似（默认 0.03%），印花税卖出 0.05% 未单列。
+//   3. TradingView 免费版 A 股分钟数据深度有限（60m 约 2~3 年）。
+// ============================================================================
+strategy("Fisher-ESI v2 [60m]",
+     overlay=false,
+     calc_on_every_tick=false,          // 只用完结 bar，等价实盘完结确认
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.03,
+     slippage=2)
+
+// ---------------- 参数 ----------------
+FISHER_LEN = input.int(9, "Fisher 窗口")
+ENTRY_MAX  = input.float(2.5, "进场 fisher 上限（ESI_ENTRY_FISHER_MAX）")
+T1_RULE    = input.bool(true, "T+1：买入当日不允许卖出（A股规则）")
+
+// ---------------- Fisher Transform（与扫描器逐行对应） ----------------
+f_fisher(len) =>
+    hh  = ta.highest(hl2, len)
+    ll  = ta.lowest(hl2, len)
+    div = hh == ll ? 0.0001 : hh - ll
+    float v = na
+    v := math.min(math.max(0.66 * ((hl2 - ll) / div - 0.5) + 0.67 * nz(v[1]), -0.999), 0.999)
+    float f = na
+    f := 0.5 * math.log((1 + v) / (1 - v)) + 0.5 * nz(f[1])
+    f
+
+// 拐点判定：上穿 = 由跌转升，下穿 = 由升转跌
+f_cross_up(f)   => f > f[1] and f[1] <= f[2]
+f_cross_dn(f)   => f < f[1] and f[1] >= f[2]
+
+// 小周期状态包：返回 [fish, trigger, 信号后判定用的最近上穿时刻, 下穿计数器]
+// 下穿用计数器而非布尔，避免一根 60m bar 内前一根 30m 的下穿被漏掉
+f_tf_state() =>
+    f  = f_fisher(FISHER_LEN)
+    up = f_cross_up(f)
+    dn = f_cross_dn(f)
+    var float lastUp = na
+    var int   dnCnt  = 0
+    if up
+        lastUp := time
+    if dn
+        dnCnt += 1
+    [f, f[1], lastUp, dnCnt]
+
+// ---------------- 多周期数据（30m/15m/5m，lookahead_off 防未来函数） ----------------
+[f30, t30, up30, dnc30] = request.security(syminfo.tickerid, "30", f_tf_state(), lookahead=barmerge.lookahead_off)
+[f15, t15, up15, dnc15] = request.security(syminfo.tickerid, "15", f_tf_state(), lookahead=barmerge.lookahead_off)
+[f5,  t5,  up5,  dnc5 ] = request.security(syminfo.tickerid, "5",  f_tf_state(), lookahead=barmerge.lookahead_off)
+
+// ---------------- 60m 主周期 ----------------
+fish60  = f_fisher(FISHER_LEN)
+trig60  = fish60[1]
+up60    = f_cross_up(fish60)
+dn60    = f_cross_dn(fish60)
+dayIdx  = int(time / 86400000)   // 自然日序号（用于 T+1 与当日禁重开）
+
+// ---------------- 状态机 ----------------
+var bool  pending    = false     // 假性失效待激活（esi_pending）
+var float signalTime = na        // pending 信号的 bar 时刻
+var int   failedDay  = na        // 最近一次 failed=是 的自然日（当日禁止重新开仓）
+var int   entryDay   = na        // 当前持仓的买入日（T+1 用）
+
+flat = strategy.position_size == 0
+
+// R1：60m 上穿时小周期任一下行 -> 假性失效，不进场，置 pending
+anySmallDown = f30 < t30 or f15 < t15 or f5 < t5
+failedToday  = not na(failedDay) and failedDay == dayIdx
+
+if flat and not pending and up60
+    if anySmallDown
+        pending    := true
+        signalTime := time
+    else if fish60 > 0 and fish60 < ENTRY_MAX and not failedToday
+        strategy.entry("L", strategy.long)
+        entryDay := dayIdx
+
+// R2：pending 复查——60m 下穿作废；三周期信号后都重新上穿且当前上行 + 60m 未破 -> 激活进场
+if pending
+    if fish60 < trig60
+        pending := false        // void 作废
+    else
+        recovered = up30 > signalTime and f30 > t30 and
+                     up15 > signalTime and f15 > t15 and
+                     up5 > signalTime and f5 > t5
+        if recovered
+            strategy.entry("L", strategy.long)
+            entryDay := dayIdx
+            pending  := false
+
+// 持仓离场
+if strategy.position_size > 0
+    t1ok = not T1_RULE or dayIdx > entryDay
+    if t1ok and dn60
+        strategy.close("L", comment="60m下穿")
+    else if t1ok and dnc30 > dnc30[1] and close < strategy.position_avg_price
+        strategy.close("L", comment="Fisher失效")
+        failedDay := dayIdx
+
+// 持仓被平后同步状态（防御：理论上 flat 分支已覆盖）
+if flat and strategy.position_size[1] > 0
+    entryDay := na
+
+// ---------------- 可视化 ----------------
+plot(fish60, "Fisher 60m", color=color.orange)
+plot(trig60, "Trigger", color=color.gray)
+hline(0)
+hline(2.5, "进场上限", color=color.red, linestyle=hline.style_dotted)
+bgcolor(pending ? color.new(color.yellow, 85) : na)
+plotshape(flat and not pending and up60 and not anySmallDown, "有效上穿",
+     shape.triangleup, location.bottom, color.green, size=size.tiny)
+plotshape(flat and up60 and anySmallDown, "假性失效",
+     shape.diamond, location.bottom, color.yellow, size=size.tiny)

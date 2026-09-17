@@ -19,7 +19,9 @@ gm_progress.txt
 tdxq_progress.txt
 results/
 scanner.log
+log.txt
 cache/
 qmt-live/
+watchlist_t0_top50.csv
 
 .build_lock/

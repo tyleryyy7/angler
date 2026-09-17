@@ -5,6 +5,8 @@ if errorlevel 1 (
     echo BUILD POOL already running, exit.
     exit /b 1
 )
+.venv\Scripts\python.exe D:\tdx\PYPlugins\user\tdx_postclose_download.py
 .venv\Scripts\python.exe build_pool_tdxq.py
-.venv\Scripts\python.exe fisher_scanner.py --annotate-hssr
+.venv\Scripts\python.exe fisher_scanner.py --annotate-hssr --source tdxq
+.venv\Scripts\python.exe run_scan.py --post-close
 rmdir .build_lock
