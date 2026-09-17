@@ -31,10 +31,11 @@
 - `watchlist.csv` — 观察池（清仓/放过但继续盯上穿回钩的票），gitignore。
   --buy 登记持仓、--sell 清仓入观察池、--watch 手动加观察池、--unwatch 移出观察池；
   持仓双向监控（上穿回钩+下穿预警）。
-- `webhook.key` — 密钥文件，gitignore，**绝不提交**（gm_token.key 已随 gm 退役废弃）。
+- `webhook.key` — 密钥文件，gitignore，**绝不提交**（gm_token.key 已随 gm 退役删除）。
 - `cache/esi_ledger.csv` — Fisher-ESI 进出场台账（code,entry_time,entry_fisher60,
   fail_time,fail_fisher30,failed,bars_held,status；status: open/closed），cache/ 整体已 gitignore。
-- `results/`、`scanner.log`、`dual_progress.txt`、`tdxq_progress.txt` — 运行产物，gitignore。
+- `results/`、`scanner.log`、`tdxq_progress.txt` — 运行产物，gitignore
+  （2026-09-17 整理：results 仅保留 9 月起，scanner.log 截断保留最近 5000 行）。
 - `executor_v2.py` — 大QMT 内置执行器 git 主版本（项目根目录；部署/格式说明见
   使用说明.md「大QMT 内置执行器」一节；部署副本 D:\国金证券QMT交易端\python\钓鱼.py
   可直接写入，用 `sync_qmt.cmd` 一键同步，备份在 QMT python\backups\）。
