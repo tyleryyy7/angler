@@ -49,14 +49,20 @@
   当日买入的股票（非 T0）禁止当日卖出（T+1），实盘卖出量取 m_nCanUseVolume。
 - `build_qmt_watchlist.py` — 生成 QMT 执行器 watchlist（`.venv` 运行）。
 - `build_ths_block.py` — 建池后把五池覆盖同步到同花顺自定义板块（`.venv` 运行，
-  已挂 build_pool.cmd 末尾）：右侧鱼塘(14C)/左侧鱼塘(14B)/深水池(146)/T0(28)/T1鱼塘(14D 新建)。
-  同花顺板块两处存储（C:\同花顺软件\同花顺\mo_<uid>\，自动探测）：stockblock.ini
+  已挂 build_pool.cmd 末尾）。板块映射按**名字**运行时反查 ID（客户端重建板块会变 ID，
+  2026-09-17 定版）：_ALL 后缀=完整池（右侧鱼塘_ALL←pool_right、左侧鱼塘_ALL←pool_left、
+  深水池_ALL←pool_deep、T0_ALL←pool_t0、T1_ALL←pool_t1）；无后缀=盘后候选
+  （右侧鱼塘、左侧鱼塘、深水池、T0、T1 ← results/candidates_最新.csv 按池分流，
+  「日K上穿」合并名单按代码所属池归入）。板块名须与客户端完全一致，找不到会跳过告警。
+  **板块名单以客户端云同步为准：本地写入的名称条目会被客户端启动时清掉，
+  新建/改名板块必须在客户端里操作，且板块里至少要有一只票**（空板块不上云，
+  2026-09-17 实测被清）；已有板块的内容可以本地写。同花顺板块两处存储
+  （C:\同花顺软件\同花顺\mo_<uid>\，自动探测）：stockblock.ini
   （GBK，NAME_MAP_TABLE + BLOCK_STOCK_CONTEXT 行 `HEXID=mkt:code,...,,`）+
-  custom_block/<十进制ID>（JSON `{"context":"code|...|,mkt|...|","ln":"","xn":""}`）。
-  市场代码：17=沪股票(60/68) 33=深股票(00/30) 20=沪ETF(51/58) 36=深ETF(15)。
-  **hexin.exe 运行时写入无效（客户端退出覆盖文件），脚本检测到会直接跳过**；
-  写前每天备份 .bak_YYYYMMDD。`ln` 校验串算法未知，先写空串，首次同步后需
-  开客户端验证板块内容是否被接受/被云同步冲掉。
+  custom_block/<十进制ID>（JSON `{"context":"code|...|,mkt|...|","ln":"","xn":""}`，
+  ln 空串客户端已接受）。市场代码：17=沪股票(60/68) 33=深股票(00/30)
+  20=沪ETF(51/58) 36=深ETF(15)。**hexin.exe 运行时会覆盖板块文件**：脚本顶部
+  AUTO_CLOSE/RELAUNCH=True，自动关客户端→写入→重开；写前每天备份 .bak_YYYYMMDD。
 - `tick_bar_builder.py` — 快照驱动实时 bar 聚合器（第二阶段）。git 主版本在项目根，
   部署副本 D:\tdx\PYPlugins\user\tick_bar_builder.py（TQ UserPY 策略「随终端运行」常驻），
   机制详见「数据通道」段 tdxq 条目。
