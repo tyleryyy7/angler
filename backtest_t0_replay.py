@@ -60,6 +60,7 @@ import math
 import os
 import sys
 import time
+from bisect import bisect_left
 from collections import defaultdict
 from statistics import median
 
@@ -84,6 +85,9 @@ LENGTH = 9
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         'cache', 'daily_qfq', 'tdxq')
 LEGACY_CODES = ('513310', '159937', '513120', '513750')   # 原四只（口径切换对照）
+STRICT_EXTRA = ('513310', '159937', '513120')   # 严格宇宙追加的实盘独有票
+                                                # （2026-09-24 起 513750 已不在
+                                                #  pool_t0，不再纳入严格宇宙）
 FIXED_NOTIONAL = 10000.0   # 每笔固定名义本金（元）：vol = 10000/价 取整百股，
                            # 最低 100 股。替代原 watchlist 固定股数——跨票可比，
                            # 与原四只口径（3000~10000 股/票）的差异见报告头注。
@@ -124,7 +128,43 @@ def fisher_series(high, low, length=LENGTH):
     return out
 
 
+def fisher_series_v(high, low, length=LENGTH):
+    # 与 fisher_series 同一递归，额外返回 value 序列——快速路径用：
+    # 完结 bar 的前缀 fisher 只算一次，形成 bar 的末元素逐 bar 增量重算
+    # （窗口 9 的 hl2 max/min + 一步递归），与全量 fisher_series 逐位一致。
+    n = len(high)
+    hl2 = [(high[i] + low[i]) / 2.0 for i in range(n)]
+    value = 0.0
+    fish = 0.0
+    out = []
+    vals = []
+    for i in range(n):
+        s = max(0, i - length + 1)
+        hh = max(hl2[s: i + 1])
+        ll = min(hl2[s: i + 1])
+        div = (hh - ll) if hh != ll else 1.0
+        v = 0.66 * ((hl2[i] - ll) / div - 0.5) + 0.67 * value
+        if v > 0.99:
+            v = 0.999
+        elif v < -0.99:
+            v = -0.999
+        value = v
+        fish = 0.5 * math.log((1.0 + v) / (1.0 - v)) + 0.5 * fish
+        out.append(fish)
+        vals.append(v)
+    return out, vals
+
+
+_LOAD_CACHE = {}
+
+
 def load_bars(code, period):
+    # 进程内缓存：15+ 个实验段重复读同一批 CSV，厚样本（每票数千行）下
+    # 重复 I/O 不可接受。数据一次运行内不变，缓存安全。
+    key = (code, period)
+    hit = _LOAD_CACHE.get(key)
+    if hit is not None:
+        return hit
     path = os.path.join(DATA_DIR, '%s_%s.csv' % (code, period))
     rows = []
     with open(path, encoding='utf-8') as f:
@@ -136,6 +176,7 @@ def load_bars(code, period):
                              'c': float(r['close'])})
             except (TypeError, ValueError):
                 continue
+    _LOAD_CACHE[key] = rows
     return rows
 
 
@@ -143,9 +184,11 @@ def load_universe(strict=False):
     # 扩样票池 = (cache/daily_qfq/tdxq 下所有 *_5m.csv) ∪ pool_t0 ∪ 原四只；
     # 仅保留 5m+15m+1h 三周期缓存齐全且 5m >= MIN_5M_BARS 根的票，
     # 排除的票连同原因列入返回的 excluded，在报告头打印。
-    # strict=True（实验 F 稳健性重验）：只用纯 T0 核心集 pool_t0 ∪ 原四只
-    # （16 只）——宽宇宙混入了 21 只"仅因缓存存在"的 ETF（其中约半数 T+1，
-    # 回放假设 T+0 高估其可执行性）；两宇宙对照检验结论对宇宙选择是否敏感。
+    # strict=True（实验 F/G 稳健性重验）：只用纯 T0 核心集 pool_t0 ∪
+    # STRICT_EXTRA（2026-09-24 起 pool_t0 重建为 9 只，严格宇宙 12 只；此前
+    # pool_t0 13 只时严格宇宙为 16 只）——宽宇宙混入了 21 只"仅因缓存存在"
+    # 的 ETF（其中约半数 T+1，回放假设 T+0 高估其可执行性）；两宇宙对照
+    # 检验结论对宇宙选择是否敏感。
     # 返回 (codes, excluded, days)：days = 每只票 5m 缓存覆盖的交易日数。
     codes = set()
     if not strict:
@@ -160,7 +203,7 @@ def load_universe(strict=False):
                 c = (r.get('code') or '').strip()
                 if c:
                     codes.add(c)
-    codes.update(LEGACY_CODES)
+    codes.update(STRICT_EXTRA if strict else LEGACY_CODES)
     ok, excluded, days = [], [], {}
     for c in sorted(codes):
         if c[:2] not in ('15', '16', '50', '51', '52', '56', '58'):
@@ -238,6 +281,23 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
     f1d = fisher_series([x['h'] for x in d1], [x['l'] for x in d1]) \
         if d1 else []
     f5_all = fisher_series([b['h'] for b in b5], [b['l'] for b in b5])
+    # 15m/1h 完结 bar 的 fisher 前缀（每 replay 调用一次；形成 bar 的末
+    # 元素逐 bar 增量重算，与全量 fisher_series 逐位一致——厚样本下全量
+    # 每 bar 重算 O(N*9) 不可接受）
+    h15_h = [x['h'] for x in h15]
+    h15_l = [x['l'] for x in h15]
+    h15_c = [x['c'] for x in h15]
+    h15_t = [x['time'] for x in h15]
+    hl2_15 = [(h15_h[j] + h15_l[j]) / 2.0 for j in range(len(h15))]
+    f15_pre, v15_pre = fisher_series_v(h15_h, h15_l)
+    if variant in ('V1', 'V3'):
+        h1_h = [x['h'] for x in h1]
+        h1_l = [x['l'] for x in h1]
+        h1_t = [x['time'] for x in h1]
+        hl2_1h = [(h1_h[j] + h1_l[j]) / 2.0 for j in range(len(h1))]
+        f1h_pre, v1h_pre = fisher_series_v(h1_h, h1_l)
+    if variant in ('V4', 'V5'):
+        d1_dates = [x['time'][:10] for x in d1]
     by_day = defaultdict(list)
     for g, b in enumerate(b5):
         by_day[b['time'][:10]].append((g, b))
@@ -267,10 +327,12 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
             m = int(hhmm[:2]) * 60 + int(hhmm[3:])
             q = win_close(m)
             qkey = '%s|%02d:%02d' % (day, q // 60, q % 60)
-            # 15m「完结 + 形成中」序列
+            # 15m「完结 + 形成中」序列（快速路径：bisect 定位完结根数 k，
+            # 形成 bar 的 fisher 末元素增量重算，数值与全量 fisher_series
+            # 逐位一致；ATR 只取尾部 14 根切片，同公式同窗口）
             qt = '%s %02d:%02d:00' % (day, q // 60, q % 60)
-            hists = [x for x in h15 if x['time'] < qt]
-            fh = fl = fo = None
+            k = bisect_left(h15_t, qt)
+            fh = fl = None
             fc = 0.0
             for j in range(i, -1, -1):
                 bj = bars[j][1]
@@ -280,10 +342,24 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                 fh = bj['h'] if fh is None else max(fh, bj['h'])
                 fl = bj['l'] if fl is None else min(fl, bj['l'])
                 fc = bj['c']
-            H = [x['h'] for x in hists] + [fh]
-            L = [x['l'] for x in hists] + [fl]
-            C = [x['c'] for x in hists] + [fc]
-            f15 = fisher_series(H, L)
+            fh2 = (fh + fl) / 2.0
+            s15 = k - (LENGTH - 1)
+            if s15 < 0:
+                s15 = 0
+            win = hl2_15[s15:k] + [fh2]
+            hh = max(win)
+            ll = min(win)
+            div = (hh - ll) if hh != ll else 1.0
+            pv15 = v15_pre[k - 1] if k >= 1 else 0.0
+            pf15 = f15_pre[k - 1] if k >= 1 else 0.0
+            vx = 0.66 * ((fh2 - ll) / div - 0.5) + 0.67 * pv15
+            if vx > 0.99:
+                vx = 0.999
+            elif vx < -0.99:
+                vx = -0.999
+            f15_last = 0.5 * math.log((1.0 + vx) / (1.0 - vx)) + 0.5 * pf15
+            f15_m1 = f15_pre[k - 1] if k >= 1 else None
+            f15_m2 = f15_pre[k - 2] if k >= 2 else None
             price = b['c']
 
             if pos is not None:
@@ -298,19 +374,21 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                         sp = atr_cache.get(qkey)
                         if sp is None:
                             sp = STOP_PCT
-                            n = min(len(H), len(L), len(C))
-                            if n >= 16:
+                            if k >= 15:
+                                Hs = h15_h[k - 14:k] + [fh]
+                                Ls = h15_l[k - 14:k] + [fl]
+                                Cs = h15_c[k - 14:k] + [fc]
                                 atr = 0.0
-                                for k in range(n - 14, n):
-                                    tr = max(H[k] - L[k],
-                                             abs(H[k] - C[k - 1]),
-                                             abs(L[k] - C[k - 1]))
+                                for k2 in range(1, 15):
+                                    tr = max(Hs[k2] - Ls[k2],
+                                             abs(Hs[k2] - Cs[k2 - 1]),
+                                             abs(Ls[k2] - Cs[k2 - 1]))
                                     atr += tr
                                 atr /= 14.0
-                                if C[-1] > 0:
+                                if Cs[-1] > 0:
                                     sp = max(STOP_PCT_MIN, min(
                                         STOP_PCT_MAX,
-                                        atr / C[-1] * STOP_ATR_MULT))
+                                        atr / Cs[-1] * STOP_ATR_MULT))
                             atr_cache[qkey] = sp
                     if price < pos[2] * (1.0 - sp):
                         reason = 'STOP'
@@ -346,18 +424,18 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                 continue
             if hhmm < ENTRY_FROM or hhmm > ENTRY_TO:
                 continue
-            cross_up = len(f15) >= 3 and f15[-1] > f15[-2] \
-                and f15[-2] <= f15[-3]
+            cross_up = f15_m2 is not None and f15_last > f15_m1 \
+                and f15_m1 <= f15_m2
             if not cross_up or last_buy_key == qkey:
                 continue
             if g < 1 or f5_all[g] < f5_all[g - 1]:   # 5m 闸门（近似 5m/1m）
                 continue
             if variant in ('V1', 'V3'):
                 # 1h「完结 + 形成中」序列：完结 1h bar（收盘 < 本窗口收盘）
-                # + 形成中 1h bar（当日 5m 聚合，含当前 bar）
+                # + 形成中 1h bar（当日 5m 聚合，含当前 bar）；快速路径同 15m
                 q60 = hour_win_close(m)
                 qt60 = '%s %02d:%02d:00' % (day, q60 // 60, q60 % 60)
-                h1d = [x for x in h1 if x['time'] < qt60]
+                k1 = bisect_left(h1_t, qt60)
                 g60h = g60l = None
                 g60c = 0.0
                 for j in range(i, -1, -1):
@@ -369,26 +447,36 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                     g60h = bj['h'] if g60h is None else max(g60h, bj['h'])
                     g60l = bj['l'] if g60l is None else min(g60l, bj['l'])
                     g60c = bj['c']
-                f60 = fisher_series(
-                    [x['h'] for x in h1d] + [g60h],
-                    [x['l'] for x in h1d] + [g60l])
-                if len(f60) < 2 or f60[-1] <= f60[-2]:   # 1h 不在上行段
-                    continue
-            if variant in ('V2', 'V3', 'V5') and not (f15[-1] < V2_THRESHOLD):
+                gh2 = (g60h + g60l) / 2.0
+                s1 = k1 - (LENGTH - 1)
+                if s1 < 0:
+                    s1 = 0
+                win1 = hl2_1h[s1:k1] + [gh2]
+                hh1 = max(win1)
+                ll1 = min(win1)
+                div1 = (hh1 - ll1) if hh1 != ll1 else 1.0
+                pv1 = v1h_pre[k1 - 1] if k1 >= 1 else 0.0
+                pf1 = f1h_pre[k1 - 1] if k1 >= 1 else 0.0
+                v1x = 0.66 * ((gh2 - ll1) / div1 - 0.5) + 0.67 * pv1
+                if v1x > 0.99:
+                    v1x = 0.999
+                elif v1x < -0.99:
+                    v1x = -0.999
+                f60_last = 0.5 * math.log((1.0 + v1x) / (1.0 - v1x)) \
+                    + 0.5 * pf1
+                if k1 < 1 or f60_last <= f1h_pre[k1 - 1]:
+                    continue        # 1h 不在上行段
+            if variant in ('V2', 'V3', 'V5') and not (f15_last < V2_THRESHOLD):
                 continue                            # 15m 非深位（<-1.5）
             if variant in ('V4', 'V5'):
                 # 日线趋势过滤（executor_t0.day_ok 口径）：只看完结日线，
                 # 形成中的当日 bar 不参与。回放严格取「进场日之前的完结
                 # 日线」（date < day，不用 drop 最后一根的方式，避免未来
                 # 函数），最后一根 fish 高于前一根才放行；数据不足不放行。
-                idx = None
-                for k in range(len(d1) - 1, -1, -1):
-                    if d1[k]['time'][:10] < day:
-                        idx = k
-                        break
-                if idx is None or idx < 1:
+                di = bisect_left(d1_dates, day) - 1
+                if di < 1:
                     continue
-                if f1d[idx] <= f1d[idx - 1]:
+                if f1d[di] <= f1d[di - 1]:
                     continue
             vol = max(100, int(FIXED_NOTIONAL / price / 100.0) * 100)
             pos = [g, i, price, vol,
@@ -492,11 +580,12 @@ def atr_sp(H, L, C):
     return max(STOP_PCT_MIN, min(STOP_PCT_MAX, atr / C[-1] * STOP_ATR_MULT))
 
 
-def build_ctx15(h15, bars, i, day, q):
-    # 与 replay 主循环同一口径的「完结+形成中」15m 序列（H, L, C）。
-    # 只供尸检反事实用；replay 主循环保持原样不动，V0 基线逐笔不变。
+def build_ctx15(h15_t, h15, bars, i, day, q):
+    # 与 replay 主循环同一口径的尾部切片（last-15 完结 + 形成中，共 16
+    # 根）——atr_sp 只消费最后 14 根 + 前收，尾部数值与全量序列逐位一致
+    # （k<15 时返回更短切片，atr_sp 的 n<16 兜底与全量口径相同）。供尸检用。
     qt = '%s %02d:%02d:00' % (day, q // 60, q % 60)
-    hists = [x for x in h15 if x['time'] < qt]
+    k = bisect_left(h15_t, qt)
     fh = fl = None
     fc = 0.0
     for j in range(i, -1, -1):
@@ -507,9 +596,10 @@ def build_ctx15(h15, bars, i, day, q):
         fh = bj['h'] if fh is None else max(fh, bj['h'])
         fl = bj['l'] if fl is None else min(fl, bj['l'])
         fc = bj['c']
-    return ([x['h'] for x in hists] + [fh],
-            [x['l'] for x in hists] + [fl],
-            [x['c'] for x in hists] + [fc])
+    s = max(0, k - 15)
+    return ([x['h'] for x in h15[s:k]] + [fh],
+            [x['l'] for x in h15[s:k]] + [fl],
+            [x['c'] for x in h15[s:k]] + [fc])
 
 
 def run_esi_autopsy(v0_trades):
@@ -531,6 +621,7 @@ def run_esi_autopsy(v0_trades):
     for code, ts in by_code.items():
         b5 = load_bars(code, '5m')
         h15 = load_bars(code, '15m')
+        h15_t = [x['time'] for x in h15]
         f5 = fisher_series([b['h'] for b in b5], [b['l'] for b in b5])
         by_day = defaultdict(list)
         for g, b in enumerate(b5):
@@ -553,7 +644,7 @@ def run_esi_autopsy(v0_trades):
                 q = win_close(m)
                 qkey = '%s|%02d:%02d' % (day, q // 60, q % 60)
                 if qkey not in spc:
-                    H, L, C = build_ctx15(h15, bars, gi + 1 + k, day, q)
+                    H, L, C = build_ctx15(h15_t, h15, bars, gi + 1 + k, day, q)
                     spc[qkey] = atr_sp(H, L, C)
                 return spc[qkey]
 
@@ -634,6 +725,10 @@ def main():
           '本金/笔（vol=10000/价 取整百股，最低 100 股）；原四只的 V0 数字'
           '随之变化，旧口径四只版报告存档 '
           'results/backtest_t0_variants_report_4codes.txt。')
+    print('样本扩充注明（实验 G，2026-09-24）：5m/15m/1h/1d 已全量重拉'
+          '（2026-06-08 起，约 78 个交易日，厚 4.6 倍）——本报告全部数字'
+          '为厚样本重算，17 天旧数字见上一轮提交存档；pool_t0 已重建为 '
+          '9 只，严格宇宙相应变为 pool_t0 ∪ STRICT_EXTRA = 12 只。')
     all_trades = {}
     for mode in ('fixed', 'atr'):
         trades = []
@@ -1302,9 +1397,13 @@ def main():
              len(simp), len(simp) + len(swor),
              100.0 * len(simp) / (len(simp) + len(swor)) if simp or swor
              else 0, ' '.join(swor) if swor else '无'))
-    print('3) 黑榜权重翻倍（2/16 = %.0f%%）后，池级结论未翻转——黑榜票的'
-          '负面影响在两种宇宙下都被 V2 的池级增益覆盖。'
-          % (100.0 * 2 / len(strict),))
+    print('3) 黑榜权重变化（严格宇宙内黑榜 %d/%d = %.0f%%）后，池级结论'
+          '%s——黑榜票的负面影响%s。'
+          % (len(in_strict), len(strict),
+             100.0 * len(in_strict) / len(strict),
+             '未翻转' if robust else '已翻转',
+             '在两种宇宙下都被 V2 的池级增益覆盖' if robust else
+             '在厚样本严格宇宙下压倒了 V2 的增益'))
     if robust:
         print('4) 结论对宇宙选择不敏感，可放心实装（仍受 13-17 天小样本与'
               '5m 近似口径约束；实装后按周回放复核）。')
@@ -1315,6 +1414,77 @@ def main():
               % ('未' if not positive else '', '不再压倒性'
                  if not dominant else '仍压倒性',
                  '推迟实装' if not positive else '缩小票池后再实装'))
+
+    # ---------- 实验 G：厚样本复验（追加段，日期见标题行） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 G：厚样本复验（5m 约 78 个交易日，样本厚 4.6 倍）  %s'
+          % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+    print('# 旧 17 天对照数字：宽宇宙 V2 +275.60（均笔 +0.93）；严格宇宙 V2 '
+          '+646.40（均笔 +4.55）。严格宇宙已变为 pool_t0(9) ∪ STRICT_EXTRA'
+          ' = 12 只（513750 不在新池内）。')
+    gs0w, gs2w = ve['V0'], ve['V2']
+    gs0s, gs2s = agg_stats(sv0), agg_stats(sv2)
+    print('\n%-10s %6s %7s %11s %9s %11s' % ('组合', '笔数', '胜率', '总净利',
+                                             '均笔', '最大单笔亏'))
+    for label, s in (('V0 宽', gs0w), ('V2 宽', gs2w),
+                     ('V0 严格', gs0s), ('V2 严格', gs2s)):
+        print('%-10s %6d %6.1f%% %+11.2f %+9.2f %+11.2f'
+              % (label, s[0], s[3], s[1], s[2], s[4]))
+
+    for tag, ts0, ts2, codes_ in (('宽宇宙', vt['V0'], vt['V2'], universe),
+                                  ('严格宇宙', sv0, sv2, strict)):
+        p0 = defaultdict(float)
+        q0 = defaultdict(int)
+        p2 = defaultdict(float)
+        q2 = defaultdict(int)
+        for t in ts0:
+            p0[t['code']] += t['net']
+            q0[t['code']] += 1
+        for t in ts2:
+            p2[t['code']] += t['net']
+            q2[t['code']] += 1
+        imp = [c for c in codes_
+               if (q0[c] or q2[c]) and p2[c] - p0[c] > 0]
+        wor = [c for c in codes_
+               if (q0[c] or q2[c]) and p2[c] - p0[c] < 0]
+        print('\n-- %s V2 vs V0 分票（厚样本）：改善 %d 只 / 恶化 %d 只 --'
+              % (tag, len(imp), len(wor)))
+        for c in ('513120', '513090'):
+            if c in set(codes_) and (q0[c] or q2[c]):
+                print('  黑榜 %s：V0 %d笔%+.2f / V2 %d笔%+.2f（delta %+0.2f）'
+                      % (c, q0[c], p0[c], q2[c], p2[c], p2[c] - p0[c]))
+
+    print('\n-- ESI 尸检关键数（厚样本，实验 B 段同口径） --')
+    if recs:
+        n_esi = len(recs)
+        m_xa_g = sum(r['xa_pct'] for r in recs) / n_esi
+        nrec_g = sum(1 for r in recs if r['rec'])
+        print('ESI 出场单 %d 笔；晚一个信号出（hold_to_exit_a）平均价差 '
+              '%+.3f%%（17 天样本 +0.05%%）；回本率 %.0f%%（17 天样本 59%%）。'
+              % (n_esi, m_xa_g, 100.0 * nrec_g / n_esi))
+
+    print('\n结论：')
+    flip = gs2w[1] <= 0 or gs2s[1] <= 0
+    decay = gs2w[2] < 0.93 * 0.5 or gs2s[2] < 4.55 * 0.5
+    if flip or decay:
+        print('17 天结论不稳健，V2 需重新评估：厚样本下 V2 宽 %+0.2f（均笔 '
+              '%+.2f）、严格 %+0.2f（均笔 %+.2f）；%s%s。'
+              % (gs2w[1], gs2w[2], gs2s[1], gs2s[2],
+                 '池级未转正' if flip else '均笔大幅衰减',
+                 '' if not decay else '（均笔跌破旧值一半）'))
+    else:
+        print('结论通过厚样本检验：V2 宽宇宙 %+0.2f（17 天 +275.60）、严格 '
+              '%+0.2f（17 天 +646.40）均池级转正，均笔 %+.2f / %+.2f 无'
+              '大幅衰减。'
+              % (gs2w[1], gs2s[1], gs2w[2], gs2s[2]))
+    if recs:
+        thicker = m_xa_g > 0.05
+        print('ESI_2 假设在 4.6 倍样本下效应量变%s：晚信号价差 %+.3f%%'
+              '（薄样本 +0.05%%）——%s。'
+              % (('厚' if thicker else '薄'), m_xa_g,
+                 '维持 ESI_2 待实装观察' if thicker
+                 else 'ESI_2 效应变薄，继续观察不实装'))
 
 
 if __name__ == '__main__':
