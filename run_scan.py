@@ -413,12 +413,12 @@ def main():
         fs.push_text(fs.hssr_report())
         return
 
-    if datetime.now().weekday() >= 5:
-        logging.info("周末不交易，退出")
-        return
-
     if args.post_close:
         post_close_candidates()
+        return
+
+    if datetime.now().weekday() >= 5:
+        logging.info("周末不交易，退出")
         return
 
     hm_now = datetime.now().strftime("%H:%M")

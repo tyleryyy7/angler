@@ -19,9 +19,13 @@
 #             (fish < trigger) and daily filter passes (last COMPLETED day
 #             bar, DAY_MODE up/above) and no position -> buy VOLUME shares.
 # Exit A    : 5m fisher cross DOWN -> sell all (normal trend exit).
-# ESI (R3)  : TF_ESI (default 1m) fisher cross DOWN and price < cost -> sell all
+# ESI (R3)  : TF_ESI (default 5m) fisher cross DOWN and price < cost -> sell all
 #             (failed trade); floating profit -> keep holding for Exit A / stop.
-# STOP      : price < cost*(1-STOP_PCT) -> sell all immediately.
+#             A code stopped out by ESI/STOP is banned from re-entry for the
+#             rest of the day (persisted in DAILY_FILE, survives restarts).
+# STOP      : price < cost*(1-stop_pct) -> sell all immediately. stop_pct is
+#             per-code in 'atr' mode (ATR14 on 15m * mult, clamped), fixed
+#             STOP_PCT in 'fixed' mode.
 # FLAT      : bar time >= FORCE_FLAT_AT -> sell all regardless of state.
 #
 # Fisher: Pine/THS standard, hl2 input, window 9 - bit-identical to
@@ -32,7 +36,7 @@ import math
 import time
 
 # ---------------- config ----------------
-ACCOUNT_ID = ''                  # fallback only; normally client-bound account
+ACCOUNT_ID = '8891080156'                  # fallback only; normally client-bound account
 WATCHLIST_FILE = r'D:\qmt\watchlist_t0.txt'   # lines: CODE,VOLUME[,T0]
 PENDING_FILE = r'D:\qmt\pending_t0.csv'       # R2 watch list, same-day only
 SIM_POS_FILE = r'D:\qmt\sim_pos_t0.csv'       # sim ledger (code,vol,cost,date)
@@ -45,9 +49,20 @@ RUN_PERIOD = '1m'                # strategy run period in the QMT client
 TF_CTX = '15m'                   # Context: primary cross
 TF_MID = '5m'                    # gate + normal exit (Exit A)
 TF_FAST = '1m'                   # gate (entry side)
-TF_ESI = TF_FAST                 # ESI exit timeframe; '5m' = calmer failed-trade stop
+TF_ESI = TF_MID                  # ESI exit timeframe; '1m' = tighter but churn-prone
 
-STOP_PCT = 0.005                 # hard stop vs cost, 0.005 = 0.5%
+STOP_PCT = 0.005                 # hard stop vs cost, 0.005 = 0.5% ('fixed' mode)
+STOP_MODE = 'atr'                # 'fixed' = STOP_PCT for all codes; 'atr' = per-code
+STOP_ATR_MULT = 1.5              # stop width = ATR14(15m) / price * mult
+STOP_PCT_MIN = 0.004             # adaptive floor: below this the 5-yuan min
+                                 # commission noise (~0.1% round trip) dominates
+STOP_PCT_MAX = 0.025             # adaptive cap: gap-prone names stay bounded
+ENTRY_DEEP_MIN = -1.5            # pool-validated entry filter (backtest_t0_replay
+                                 # experiment C, 37 ETFs): only buy 15m crosses
+                                 # with fish15 below this deep-extreme level.
+                                 # Bare cross-ups lose pool-wide (-3006 vs +276
+                                 # per sample period); 32/37 codes improve.
+                                 # Set to 999 to disable (old behavior).
 ENTRY_FROM = '09:40'             # no entries before (open volatility)
 ENTRY_TO = '14:40'               # no new entries after
 FORCE_FLAT_AT = '14:55'          # exit everything (before 14:57 SZ closing auction)
@@ -57,15 +72,25 @@ MAX_DAILY_LOSS = -300.0          # account-level realized pnl floor; then flat-o
 FEE_MIN_NOTIONAL = 50000.0       # below this the 5-yuan commission floor dominates
 
 USE_HARD_STOP = True
+REV = '2026-09-23c'              # bumped on every repo edit; printed in the start
+                                 # banner so the deployed copy's version is always
+                                 # identifiable from the client log (a stale paste
+                                 # once ran silently for a whole day)
 USE_ENTRY_GATE = True            # 5m/1m not-in-down gate on entry
 USE_EXIT_A = True                # 5m fisher cross down -> sell all
 USE_ESI_EXIT = True              # TF_ESI cross down + floating loss -> sell all
-USE_DAY_FILTER = True            # daily fisher filter on entries
+USE_DAY_FILTER = False            # daily fisher filter on entries
 DAY_MODE = 'up'                  # 'up' = daily fish rising; 'above' = not in down state
+USE_EXIT_CONFIRM = True          # Exit A defer: 5m cross down + floating profit ->
+                                 # wait until 1m in down state; void if 5m fish
+                                 # recovers above trigger. Floating loss sells at once.
+USE_REENTRY_5M = True            # 5m cross up + 15m trend intact + 1m not down
+                                 # -> re-entry (chase) even without a fresh 15m pivot
 
 # Optional A/B backtest overrides, KEY=VALUE per line, e.g.:
 #   USE_ESI_EXIT=0
-#   TF_ESI=5m
+#   TF_ESI=1m
+#   USE_REENTRY_5M=0
 #   USE_DAY_FILTER=0
 #   DAY_MODE=above
 # Whitelisted keys only; unknown keys are ignored with a WARN.
@@ -79,12 +104,20 @@ PENDING = {}
 SIM_POS = {}
 TRADES_TODAY = {}                # code -> entry count today
 CODE_PNL = {}                    # code -> realized pnl today (sim or known cost)
+FAILED_TODAY = set()             # codes stopped out by ESI/STOP today: no re-entry
 DAY_DATE = ''
 DAY_PNL = 0.0
 DAY_STOPPED = False
 LAST_ACT = {}
 LAST_PRINT = {}
 DAY_STATE = {}                   # (code, yyyymmdd) -> bool, daily filter cache
+MD2_WARNED = set()               # market_data2 empty-result warnings already printed
+PSELL = {}                       # code -> key_mid of deferred Exit A (floating profit,
+                                 # waiting 1m down confirm; in-memory, lost on restart)
+VERIFY = {}                      # code -> [side, base_pos, vol, tries, tag]: post-order
+                                 # fill check next bar; retry once, then WeCom alert
+WEBHOOK_KEY_FILE = r'D:\angler\webhook.key'
+STOPPCT = {}                     # code -> (ctx_bar_key, pct): ATR stop cache
 SIM_POS_PATH = SIM_POS_FILE
 DAILY_PATH = DAILY_FILE
 
@@ -112,6 +145,31 @@ def fisher_series(high, low, length):
 
 
 def get_hist(ContextInfo, code, period, field):
+    # Primary: get_market_data2 via the pandas-free wrapper (old
+    # get_history_data can return history ending yesterday intraday).
+    try:
+        d = ContextInfo.get_market_data_ex_ori([field], [code], period=period,
+                                               count=HIST_BARS, dividend_type='none',
+                                               fill_data=True, subscribe=True)
+        data = d.get(code) if isinstance(d, dict) else None
+        if data is None and isinstance(d, dict) and len(d) == 1:
+            data = list(d.values())[0]      # key format may differ from code
+        if isinstance(data, dict):
+            # {field: [v, ...], 'stime': [...]} shape
+            vals = data.get(field)
+            if vals:
+                return [float(x) for x in list(vals)[-HIST_BARS:]]
+        elif data:
+            # [[stime, v, ...], ...] row shape
+            rows = sorted(data, key=lambda r: r[0])
+            return [float(r[-1]) for r in rows[-HIST_BARS:]]
+        wkey = '%s|%s' % (code, period)
+        if wkey not in MD2_WARNED:
+            MD2_WARNED.add(wkey)
+            print('[WARN] %s %s market_data2 empty, keys=%s -> fallback'
+                  % (code, period, list(d.keys())[:3] if isinstance(d, dict) else type(d)))
+    except Exception as e:
+        print('[WARN] %s %s market_data2 failed, fallback: %s' % (code, period, e))
     d = ContextInfo.get_history_data(HIST_BARS, period, field, code)
     return list(d[code])
 
@@ -204,8 +262,7 @@ def get_position(ContextInfo, code):
 
 def get_last_price(ContextInfo, code):
     try:
-        d = ContextInfo.get_history_data(2, RUN_PERIOD, 'close', code)
-        c = list(d[code])
+        c = get_hist(ContextInfo, code, RUN_PERIOD, 'close')[-2:]
         if c:
             return float(c[-1])
     except Exception:
@@ -221,14 +278,87 @@ def do_order(ContextInfo, code, op, volume):
           % (bar_dt(ContextInfo), op, code, volume, r))
 
 
+def wecom_alert(msg):
+    # best-effort WeCom robot push, stdlib only (QMT builtin env has no requests)
+    try:
+        f = open(WEBHOOK_KEY_FILE, 'r')
+        key = f.read().strip()
+        f.close()
+        import json
+        import urllib.request
+        body = json.dumps({'msgtype': 'text',
+                           'text': {'content': msg}}).encode('utf-8')
+        req = urllib.request.Request(
+            'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=' + key,
+            data=body, headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        print('[WARN] wecom alert failed: %s' % e)
+
+
+def strict_position(ContextInfo, code):
+    # position volume only; None when the query itself failed (untrustworthy).
+    # Fill verification must never act on a failed query (get_position swallows
+    # exceptions and returns 0, which would cause bogus retries / double orders).
+    try:
+        positions = get_trade_detail_data(acc_id(ContextInfo), 'stock', 'position')
+        plain = code.split('.')[0]
+        for p in positions:
+            pid = getattr(p, 'm_strInstrumentID', '')
+            exch = getattr(p, 'm_strExchangeID', '')
+            if pid == plain or ('%s.%s' % (pid, exch)) == code:
+                return getattr(p, 'm_nVolume', 0)
+        return 0
+    except Exception as e:
+        print('[WARN] %s verify position query failed: %s' % (code, e))
+        return None
+
+
+def verify_fills(ContextInfo):
+    # one bar after submit: unfilled -> retry once -> drop phantom + WeCom alert.
+    # passorder returning 0 only means the client parsed the params; a dead
+    # trade session drops the order silently (2026-09-22 incident).
+    for code in list(VERIFY.keys()):
+        side, base, vol, tries, tag = VERIFY[code]
+        pos = strict_position(ContextInfo, code)
+        if pos is None:
+            continue                       # unknown, check again next bar
+        done = pos >= base + vol if side == 'BUY' else pos <= base - vol
+        if done:
+            print('[VERIFY] %s %s x%d filled (pos %d->%d)'
+                  % (code, side, vol, base, pos))
+            del VERIFY[code]
+            continue
+        if tries == 0:
+            VERIFY[code][3] = 1
+            print('[VERIFY] %s %s x%d NOT filled (pos %d, base %d), retry once'
+                  % (code, side, vol, pos, base))
+            do_order(ContextInfo, code, 23 if side == 'BUY' else 24, vol)
+            continue
+        del VERIFY[code]
+        if side == 'BUY' and pos <= base and code in SIM_POS:
+            simpos_on_sell(code)           # phantom entry, never really bought
+        msg = ('QMT FILL FAIL: %s %s x%d not filled after retry '
+               '(pos %d, base %d), manual check needed'
+               % (side, code, vol, pos, base))
+        print('[VERIFY] !!! %s' % msg)
+        wecom_alert(msg)
+
+
 def config_override():
     # optional KEY=VALUE lines for A/B backtests; whitelisted keys only
     global USE_HARD_STOP, USE_ENTRY_GATE, USE_EXIT_A, USE_ESI_EXIT
-    global USE_DAY_FILTER, DAY_MODE
+    global USE_DAY_FILTER, DAY_MODE, USE_REENTRY_5M, USE_EXIT_CONFIRM
     global TF_ESI, STOP_PCT, MAX_DAILY_LOSS, MAX_TRADES_PER_CODE
+    global STOP_MODE, STOP_ATR_MULT, STOP_PCT_MIN, STOP_PCT_MAX, ENTRY_DEEP_MIN
     bools = {'USE_HARD_STOP': 'USE_HARD_STOP', 'USE_ENTRY_GATE': 'USE_ENTRY_GATE',
              'USE_EXIT_A': 'USE_EXIT_A', 'USE_ESI_EXIT': 'USE_ESI_EXIT',
-             'USE_DAY_FILTER': 'USE_DAY_FILTER'}
+             'USE_DAY_FILTER': 'USE_DAY_FILTER', 'USE_REENTRY_5M': 'USE_REENTRY_5M',
+             'USE_EXIT_CONFIRM': 'USE_EXIT_CONFIRM'}
+    floats = {'STOP_PCT': 'STOP_PCT', 'STOP_ATR_MULT': 'STOP_ATR_MULT',
+              'STOP_PCT_MIN': 'STOP_PCT_MIN', 'STOP_PCT_MAX': 'STOP_PCT_MAX',
+              'ENTRY_DEEP_MIN': 'ENTRY_DEEP_MIN',
+              'MAX_DAILY_LOSS': 'MAX_DAILY_LOSS'}
     try:
         f = open(CONFIG_FILE, 'r', encoding='utf-8')
         lines = f.readlines()
@@ -245,16 +375,20 @@ def config_override():
             globals()[bools[k]] = v not in ('0', 'false', 'False', 'no')
         elif k == 'TF_ESI':
             TF_ESI = v
+        elif k == 'STOP_MODE':
+            if v in ('fixed', 'atr'):
+                STOP_MODE = v
+            else:
+                print('[WARN] bad STOP_MODE %s, ignored' % v)
+                continue
         elif k == 'DAY_MODE':
             if v in ('up', 'above'):
                 DAY_MODE = v
             else:
                 print('[WARN] bad DAY_MODE %s, ignored' % v)
                 continue
-        elif k == 'STOP_PCT':
-            STOP_PCT = float(v)
-        elif k == 'MAX_DAILY_LOSS':
-            MAX_DAILY_LOSS = float(v)
+        elif k in floats:
+            globals()[floats[k]] = float(v)
         elif k == 'MAX_TRADES_PER_CODE':
             MAX_TRADES_PER_CODE = int(v)
         else:
@@ -359,8 +493,8 @@ def simpos_save():
 
 
 def daily_load():
-    # returns (trades_dict, code_pnl_dict, pnl_sum, stopped) for DAY_DATE
-    trades, code_pnl, pnl, stopped = {}, {}, 0.0, False
+    # returns (trades_dict, code_pnl_dict, pnl_sum, stopped, failed_set) for DAY_DATE
+    trades, code_pnl, pnl, stopped, failed = {}, {}, 0.0, False, set()
     try:
         f = open(DAILY_PATH, 'r', encoding='utf-8')
         for ln in f:
@@ -374,19 +508,21 @@ def daily_load():
                 pnl += float(p[3])
                 if p[4] == '1':
                     stopped = True
+                if len(p) >= 6 and p[5] == '1':
+                    failed.add(p[1])
         f.close()
     except Exception:
         pass
-    return trades, code_pnl, pnl, stopped
+    return trades, code_pnl, pnl, stopped, failed
 
 
 def daily_save():
     try:
         f = open(DAILY_PATH, 'w', encoding='utf-8')
         for code in CODES:
-            f.write('%s,%s,%d,%.2f,%d\n' % (DAY_DATE, code,
+            f.write('%s,%s,%d,%.2f,%d,%d\n' % (DAY_DATE, code,
                     TRADES_TODAY.get(code, 0), CODE_PNL.get(code, 0.0),
-                    1 if DAY_STOPPED else 0))
+                    1 if DAY_STOPPED else 0, 1 if code in FAILED_TODAY else 0))
         f.close()
     except Exception as e:
         print('[WARN] daily save failed: %s' % e)
@@ -414,6 +550,64 @@ def bar_hhmm(ContextInfo):
         return time.strftime('%H:%M', time.localtime(tt / 1000))
     except Exception:
         return time.strftime('%H:%M')
+
+
+def ctx_bar_key(ContextInfo):
+    # identity of the currently forming TF_CTX (15m) bar, by its close time.
+    # Used as the BUY dedup key: fisher values flickering around the trigger
+    # within one bar must not re-fire the same signal.
+    try:
+        tt = ContextInfo.get_bar_timetag(ContextInfo.barpos)
+        lt = time.localtime(tt / 1000)
+    except Exception:
+        lt = time.localtime()
+    m = lt.tm_hour * 60 + lt.tm_min
+    if m <= 570:                        # at/before 09:30 -> bar closing 09:45
+        q = 585
+    elif m % 15 == 0 and m != 780:      # exact grid minute: bar just closed
+        q = m                           # (13:00 belongs to the 13:15 bar)
+    else:
+        q = (m // 15 + 1) * 15
+    if 690 < q < 795:                   # lunch gap -> first afternoon bar 13:15
+        q = 795
+    if q > 900:
+        q = 900
+    return time.strftime('%Y%m%d', lt) + '|%02d:%02d' % (q // 60, q % 60)
+
+
+def stop_pct(ContextInfo, code):
+    # per-code hard-stop width. 'fixed' -> STOP_PCT; 'atr' -> ATR14 on 15m bars
+    # * mult, clamped to [MIN, MAX] so quiet names are not stopped out by
+    # commission-level noise and gap-prone names stay bounded. Cached per
+    # 15m bar (recomputed once per bar, not on every 1m tick).
+    if STOP_MODE != 'atr':
+        return STOP_PCT
+    key = ctx_bar_key(ContextInfo)
+    hit = STOPPCT.get(code)
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        h = get_hist(ContextInfo, code, TF_CTX, 'high')
+        l = get_hist(ContextInfo, code, TF_CTX, 'low')
+        c = get_hist(ContextInfo, code, TF_CTX, 'close')
+    except Exception as e:
+        print('[WARN] %s ATR stop data failed, fallback %.3f: %s'
+              % (code, STOP_PCT, e))
+        return STOP_PCT
+    n = min(len(h), len(l), len(c))
+    if n < 16:
+        return STOP_PCT
+    atr = 0.0
+    for i in range(n - 14, n):
+        tr = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+        atr += tr
+    atr /= 14.0
+    price = c[-1]
+    if price <= 0:
+        return STOP_PCT
+    pct = max(STOP_PCT_MIN, min(STOP_PCT_MAX, atr / price * STOP_ATR_MULT))
+    STOPPCT[code] = (key, pct)
+    return pct
 
 
 def eff_position(ContextInfo, code):
@@ -458,12 +652,13 @@ def init(ContextInfo):
     SIM_POS = simpos_load()
     DAY_DATE = time.strftime('%Y%m%d')
     if getattr(ContextInfo, 'do_back_test', False):
-        TRADES_TODAY.clear(); CODE_PNL.clear()
+        TRADES_TODAY.clear(); CODE_PNL.clear(); FAILED_TODAY.clear()
         DAY_PNL, DAY_STOPPED = 0.0, False
     else:
-        t, cp, p, s = daily_load()
+        t, cp, p, s, fd = daily_load()
         TRADES_TODAY.clear(); TRADES_TODAY.update(t)
         CODE_PNL.clear(); CODE_PNL.update(cp)
+        FAILED_TODAY.clear(); FAILED_TODAY.update(fd)
         DAY_PNL, DAY_STOPPED = p, s
     ContextInfo.set_universe(CODES)
     for code in CODES:
@@ -472,27 +667,34 @@ def init(ContextInfo):
             print('[WARN] %s real position %d without sim ledger entry: if carried '
                   'overnight, STALE exit does not apply, manual check needed'
                   % (code, pos))
-    print('=== qmt_executor_t0 start, account=%s codes=%d vol=%d period=%s stop=%.3f '
-          'gate=%s exit_a=%s esi=%s esi_tf=%s day_filter=%s/%s flat=%s max_trades=%d max_loss=%.0f backtest=%s '
+    print('=== qmt_executor_t0 rev=%s start, account=%s codes=%d vol=%d period=%s stop=%s/%.2f '
+          'gate=%s exit_a=%s esi=%s esi_tf=%s day_filter=%s/%s flat=%s max_trades=%d max_loss=%.0f '
+          'exit_confirm=%s reentry5m=%s backtest=%s '
           'pending=%s trades=%s pnl=%.2f stopped=%s t0=%d ==='
-          % (acc_id(ContextInfo), len(CODES), VOLUME, RUN_PERIOD, STOP_PCT,
+          % (REV, acc_id(ContextInfo), len(CODES), VOLUME, RUN_PERIOD, STOP_MODE, STOP_ATR_MULT,
              USE_ENTRY_GATE, USE_EXIT_A, USE_ESI_EXIT, TF_ESI, USE_DAY_FILTER, DAY_MODE, FORCE_FLAT_AT,
              MAX_TRADES_PER_CODE, MAX_DAILY_LOSS,
+             USE_EXIT_CONFIRM, USE_REENTRY_5M,
              getattr(ContextInfo, 'do_back_test', False),
              list(PENDING.keys()), TRADES_TODAY, DAY_PNL, DAY_STOPPED, len(T0_SET)))
 
 
-def on_sell(ContextInfo, code, sellable, cost, reason, key, is_sim):
+def on_sell(ContextInfo, code, pos, sellable, cost, reason, key, is_sim):
     # shared sell path: order, ledger, pnl, circuit breaker
     global DAY_PNL, DAY_STOPPED
     price = get_last_price(ContextInfo, code)
     do_order(ContextInfo, code, 24, sellable)
+    VERIFY[code] = ['SELL', pos, sellable, 0, reason]
     LAST_ACT[(code, reason)] = key
     simpos_on_sell(code)
     if price > 0.0 and cost > 0.0:
         d = (price - cost) * sellable
         CODE_PNL[code] = CODE_PNL.get(code, 0.0) + d
         DAY_PNL += d
+    if reason in ('ESI', 'STOP') and code not in FAILED_TODAY:
+        FAILED_TODAY.add(code)
+        print('[BAN] %s %s stopped out (%s), no re-entry today'
+              % (bar_dt(ContextInfo), code, reason))
     daily_save()
     print('>>> SELL %s %s %d shares (%s), pnl_day=%.2f'
           % (bar_dt(ContextInfo), code, sellable, reason, DAY_PNL))
@@ -522,17 +724,26 @@ def handlebar(ContextInfo):
         DAY_DATE = today
         TRADES_TODAY.clear()
         CODE_PNL.clear()
+        FAILED_TODAY.clear()
         DAY_STATE.clear()
         DAY_PNL = 0.0
         DAY_STOPPED = False
         if PENDING:
             PENDING.clear()
             pending_save()
+        VERIFY.clear()
         daily_save()
         print('=== new day %s, counters and pending reset ===' % today)
     bar_key = '%s %s' % (bar_dt(ContextInfo), ContextInfo.barpos)
     hhmm = bar_hhmm(ContextInfo)
+    hb = int(time.time() // 300)
+    if LAST_PRINT.get('_hb') != hb:
+        # heartbeat every 5 min so log silence is distinguishable from a stall
+        LAST_PRINT['_hb'] = hb
+        print('[HB] %s alive codes=%d pnl_day=%.2f' % (bar_key, len(CODES), DAY_PNL))
     t_start = time.time()
+    if not getattr(ContextInfo, 'do_back_test', False):
+        verify_fills(ContextInfo)
     for code in CODES:
         try:
             f = tf_series(ContextInfo, code, TF_CTX)
@@ -554,6 +765,11 @@ def handlebar(ContextInfo):
             print('[%s] %s fish15=%.3f trig=%.3f pos=%d pnl_day=%.2f%s'
                   % (bar_key, code, f60, t60, pos, DAY_PNL, is_sim and '(sim)' or ''))
 
+        if code in VERIFY:
+            # an order for this code is awaiting fill verification; no new
+            # orders until it resolves (prevents order pileup)
+            continue
+
         if pos > 0:
             if sellable <= 0:
                 pkey2 = '%s|T1' % pkey
@@ -565,17 +781,39 @@ def handlebar(ContextInfo):
             s = SIM_POS.get(code)
             is_stale = bool(s) and s[2] != today
             if is_stale and hhmm >= STALE_EXIT_AT:
-                on_sell(ContextInfo, code, sellable, cost, 'STALE', key_ctx, is_sim)
+                on_sell(ContextInfo, code, pos, sellable, cost, 'STALE', key_ctx, is_sim)
                 continue
             if hhmm >= FORCE_FLAT_AT:
-                on_sell(ContextInfo, code, sellable, cost, 'FLAT', key_ctx, is_sim)
+                on_sell(ContextInfo, code, pos, sellable, cost, 'FLAT', key_ctx, is_sim)
                 continue
             price = get_last_price(ContextInfo, code)
+            sp = stop_pct(ContextInfo, code)
             if USE_HARD_STOP and cost > 0.0 and price > 0.0 \
-                    and price < cost * (1.0 - STOP_PCT):
-                on_sell(ContextInfo, code, sellable, cost, 'STOP',
+                    and price < cost * (1.0 - sp):
+                print('[STOP] %s %s price %.3f < cost %.3f -%.2f%%'
+                      % (bar_dt(ContextInfo), code, price, cost, sp * 100))
+                on_sell(ContextInfo, code, pos, sellable, cost, 'STOP',
                         '%s|%.4f' % (key_ctx, price), is_sim)
                 continue
+            # deferred Exit A: 5m crossed down while floating profit; sell once
+            # 1m enters down state; void if 5m fish recovers above its trigger
+            if code in PSELL:
+                st_mid = tf_state(ContextInfo, code, TF_MID)
+                if st_mid is None:
+                    continue
+                if not st_mid[2]:
+                    PSELL.pop(code, None)
+                    print('[CANCEL] %s %s deferred sell void (5m fish back above trigger)'
+                          % (bar_dt(ContextInfo), code))
+                else:
+                    st_fast = tf_state(ContextInfo, code, TF_FAST)
+                    if st_fast is None:
+                        print('[WARN] %s confirm state unknown, defer kept' % code)
+                        continue
+                    if st_fast[2]:
+                        on_sell(ContextInfo, code, pos, sellable, cost, 'EXIT_A_C',
+                                PSELL.pop(code), is_sim)
+                    continue
             # structure exits: ESI on TF_ESI, normal exit on 5m
             cd_mid = False
             cd_esi = False
@@ -595,13 +833,19 @@ def handlebar(ContextInfo):
                     and price < cost:
                 key_esi = '%.4f|%.4f' % (f_esi[-2], f_esi[-3])
                 if LAST_ACT.get((code, 'ESI')) != key_esi:
-                    on_sell(ContextInfo, code, sellable, cost, 'ESI', key_esi, is_sim)
+                    on_sell(ContextInfo, code, pos, sellable, cost, 'ESI', key_esi, is_sim)
                     continue
                 # floating profit: keep holding for Exit A / stop / flat
             if USE_EXIT_A and cd_mid:
                 key_mid = '%.4f|%.4f' % (f_mid[-2], f_mid[-3])
                 if LAST_ACT.get((code, 'EXIT_A')) != key_mid:
-                    on_sell(ContextInfo, code, sellable, cost, 'EXIT_A', key_mid, is_sim)
+                    if USE_EXIT_CONFIRM and cost > 0.0 and price >= cost:
+                        PSELL[code] = key_mid
+                        print('[DEFER] %s %s 5m cross down but floating profit '
+                              '%.3f >= cost %.3f, wait 1m down confirm'
+                              % (bar_dt(ContextInfo), code, price, cost))
+                        continue
+                    on_sell(ContextInfo, code, pos, sellable, cost, 'EXIT_A', key_mid, is_sim)
                     continue
             continue
 
@@ -624,6 +868,19 @@ def handlebar(ContextInfo):
             continue
         if TRADES_TODAY.get(code, 0) >= MAX_TRADES_PER_CODE:
             continue
+        if code in FAILED_TODAY:
+            continue
+        key_bar = ctx_bar_key(ContextInfo)
+        if f60 >= ENTRY_DEEP_MIN:
+            # pool-validated deep-extreme filter (see ENTRY_DEEP_MIN comment):
+            # shallow/high crosses have no edge; only buy panic-depth crosses.
+            # Throttled per 15m bar (bar_key), not per fish tick.
+            dk = (code, 'DEEP')
+            if LAST_PRINT.get(dk) != bar_key:
+                LAST_PRINT[dk] = bar_key
+                print('[SKIP] %s %s fish15=%.3f not below %.2f (shallow cross, no edge)'
+                      % (bar_key, code, f60, ENTRY_DEEP_MIN))
+            continue
 
         def gates_clear():
             # gate: 5m and 1m both not in down state; None -> data unknown
@@ -635,31 +892,57 @@ def handlebar(ContextInfo):
                     return False
             return True
 
-        if cross_up and LAST_ACT.get((code, 'BUY')) != key_ctx:
+        if cross_up and LAST_ACT.get((code, 'BUY')) != key_bar:
             g = gates_clear() if USE_ENTRY_GATE else True
             if g is None:
                 print('[WARN] %s gate data unknown, skip bar' % code)
                 continue
             if g is False:
-                pending_add(code, key_ctx)
+                pending_add(code, key_bar)
                 print('[SKIP] %s %s 15m cross up but gate down '
                       '(fake-invalid, watching)' % (bar_dt(ContextInfo), code))
                 continue
             if not day_pass(ContextInfo, code, 'BUY'):
                 continue
-            buy(ContextInfo, code, f60, key_ctx, 'BUY')
+            buy(ContextInfo, code, f60, key_bar, 'BUY')
             continue
+
+        # 5m re-entry (chase): 5m cross up while the 15m trend is intact and
+        # 1m is not down. Roles flipped vs the primary entry: 5m triggers,
+        # 15m/1m gate. Same window/trade-limit/breaker constraints applied above.
+        if USE_REENTRY_5M:
+            try:
+                f_mid = tf_series(ContextInfo, code, TF_MID)
+            except Exception:
+                f_mid = []
+            if len(f_mid) >= 3:
+                cu_mid = f_mid[-1] > f_mid[-2] and f_mid[-2] <= f_mid[-3]
+                # same dedup key as the primary path: one BUY per 15m bar,
+                # regardless of which path fired (2026-09-23: cross_up + REENTRY5M
+                # within 3s doubled the position to 20000)
+                if cu_mid and LAST_ACT.get((code, 'BUY')) != key_bar:
+                    st_ctx = tf_state(ContextInfo, code, TF_CTX)
+                    st_fast = tf_state(ContextInfo, code, TF_FAST)
+                    if st_ctx is None or st_fast is None:
+                        print('[WARN] %s reentry gate data unknown, skip bar' % code)
+                        continue
+                    if st_ctx[2] or st_fast[2]:
+                        continue
+                    if not day_pass(ContextInfo, code, 'REENTRY5M'):
+                        continue
+                    buy(ContextInfo, code, f60, key_bar, 'REENTRY5M')
+                    continue
 
         # R2 reactivation watch (same-day only; wiped at day rollover)
         if code not in PENDING:
             continue
         g = gates_clear() if USE_ENTRY_GATE else True
         if g:
-            if LAST_ACT.get((code, 'BUY')) == key_ctx:
+            if LAST_ACT.get((code, 'BUY')) == key_bar:
                 continue
             if not day_pass(ContextInfo, code, 'REACTIVATED'):
                 continue
-            buy(ContextInfo, code, f60, key_ctx, 'REACTIVATED')
+            buy(ContextInfo, code, f60, key_bar, 'REACTIVATED')
     elapsed = time.time() - t_start
     if elapsed > 30:
         print('[WARN] handlebar took %.1fs for %d codes' % (elapsed, len(CODES)))
@@ -673,6 +956,7 @@ def buy(ContextInfo, code, f_ctx, key_ctx, tag):
         print('[WARN] %s notional %.0f < %.0f: 5-yuan commission floor eats the '
               'edge, check volume' % (code, price * vol, FEE_MIN_NOTIONAL))
     do_order(ContextInfo, code, 23, vol)
+    VERIFY[code] = ['BUY', 0, vol, 0, tag]
     LAST_ACT[(code, 'BUY')] = key_ctx
     pending_remove(code)
     TRADES_TODAY[code] = TRADES_TODAY.get(code, 0) + 1

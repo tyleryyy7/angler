@@ -39,8 +39,44 @@
 - `executor_v2.py` — 大QMT 内置执行器 git 主版本（项目根目录；部署/格式说明见
   使用说明.md「大QMT 内置执行器」一节；部署副本 D:\国金证券QMT交易端\python\钓鱼.py
   可直接写入，用 `sync_qmt.cmd` 一键同步，备份在 QMT python\backups\）。
+  运行时台账：`pending.csv`（R2）、`sim_pos.csv`（幽灵持仓账）、`exdef.csv`
+  （T+1 冻结期 latched 的卖出信号，解冻即执行，坑 #16）。
+  `executor_t0.py`（高频T0 版）部署副本为同目录 高频T0.py，同一脚本同步。
+  2026-09-21 防磨损改版：ESI 止损默认改 5m（TF_ESI=TF_MID，1m 反复抽止损是当日
+  T0 池磨损主因）；ESI/STOP 止损后该票当日禁止再进场（FAILED_TODAY，写进
+  daily_t0.csv 第 6 列，重启不丢）；BUY 去重键改用 15m bar 收盘时刻
+  （ctx_bar_key），fish 在 trigger 附近抖动不再反复触发"新"上穿；
+  USE_REENTRY_5M / USE_EXIT_CONFIRM 加入 t0_config.txt 白名单。
+  2026-09-23 修复：三条进场路径（cross_up/REENTRY5M/REACTIVATED）的去重键统一为
+  key_bar——旧版 REENTRY5M 用 'RE|' 前缀键占同一个 LAST_ACT 槽，与主路径互不失效，
+  同一根 15m bar 内 3 秒双发、仓位翻倍（513120 当日 10000→20000 两次）。
+  2026-09-23 再加：**深极值进场过滤（ENTRY_DEEP_MIN=-1.5）**——全池回放
+  （backtest_t0_replay.py 实验 C，37 只 T0 ETF × 13~17 天，固定 1 万/笔）：
+  裸 15m 上穿池级亏损 −3006 元，过滤后 +276（均笔 −5.41→+0.93，32/37 改善，
+  硬止损 7 笔→2 笔）；浅位上穿无 edge 是池级结论。1h 趋势对齐（V1）在全池
+  反恶化（−1884），勿走。配套：watchlist_t0 移除 513120（实验 A/B/C 三重
+  垫底，池级黑榜：513120/513090/589120/589720/513040）。ENTRY_DEEP_MIN 进
+  t0_config.txt 白名单（999=禁用）。大周期过滤全否决（实验 D，2026-09-23）：1h 趋势对齐（V1）池级 −1884 反恶化；日线趋势（V4）边际改善仍亏（−641）；日线∧深极值（V5）无叠加（−163 差于 V2）。维持 V2 单过滤。513120 是罕见的'趋势票'（V4 下 +109），单票不足以支撑开关，未来如需 per-code 规则路由再议。严格宇宙稳健性（实验 F，2026-09-23）：宽宇宙 37 只混入了 21 只缓存遗留票（约半数 T+1，回放高估可执行性）；收紧到纯 T0 16 只（pool_t0 13 + 实盘独有 3）后 V2 更强（+276→+646，均笔 +4.55，最大单笔亏 -68.5，14/16 改善，恶化仍只有 513120/513090）。结论对宇宙选择不敏感；周度/月度复核一律用严格宇宙（replay strict 开关）。关强平否决（实验 E，2026-09-23）：V2 去 FLAT 后 +276→-619，过夜 8/8 全亏（首夜缺口均值 -0.68%、为正占比 0%）——深水池=日线 Fisher<-2=下跌趋势池，隔夜漂移结构性为负，14:55 强平是生存机制不是洁癖；样本期若池子转升势可重测。ESI 二次确认制（晚一个 5m cross down 才卖）
+  扩样后效应减半（285 笔，+0.05%/笔，15/37 票反例），未实装，数据攒厚再议；
+  ESI 时间宽限（延迟 N bar）全样本恶化，否决。回放均含双边佣金 max(5,0.025%)。
+  2026-09-22 再加：**止损自适应（STOP_MODE='atr'）**——硬止损宽度按票计算
+  ATR14(15m)×1.5、夹取 [0.4%, 2.5%]（下限防最低佣金噪音、上限防高缺口票
+  宽失控），每 15m bar 每票算一次缓存；'fixed' 保留原固定 0.5%。动机：
+  四只 T0 ETF 平均隔夜缺口 0.6%~1.6%，固定 0.5% 止损在高缺口票上被随机
+  振出。参数 STOP_MODE/STOP_ATR_MULT/STOP_PCT_MIN/MAX 全进 t0_config.txt
+  白名单。**跳空实证**：缺口回补率 46~56%（无方向优势），"禁顺缺口交易"
+  无数据支持未采纳；跳空的真实危害是波动尺度错配 + 早盘价格坐标污染。
+  取数走 `ContextInfo.get_market_data_ex_ori`（新接口 get_market_data2 的无 pandas
+  封装；官方推荐的 get_market_data_ex 依赖 pandas，内置环境不可用），
+  旧 `get_history_data` 仅作异常回退（2026-09-18 起：旧接口盘中曾返回止于昨日的
+  分钟历史，导致 fisher 盘中冻结）。
 - `sync_qmt.cmd` / `sync_qmt.ps1` — 执行器一键同步脚本（CRLF；中文路径必须走 ps1
   PowerShell，cmd 直接写中文路径会被 GBK 解析乱码——2026-09-15 实测）。
+  同步两个执行器：executor_v2.py → 钓鱼.py、executor_t0.py → 高频T0.py。
+  **2026-09-18 实测失效**：客户端对 python\ 目录有文件虚拟化——PowerShell 写入的明文
+  只有 PS 进程可见，客户端读的是它自己保存的 blob 视图（在客户端编辑器保存过一次
+  后触发），外部同步不再生效。部署只能改在客户端编辑器里全选粘贴仓库文件内容；
+  盘中调参走 D:\qmt\t0_config.txt（config_override，白名单键），不要在客户端改代码。
 - `qmt-live/` — 目录联接 → D:\qmt（QMT 运行时文件：watchlist.txt / pending.csv /
   sim_pos.csv 模拟仓位账本），VSCode 可视化查看编辑，gitignore。
   watchlist.txt 由 `build_qmt_watchlist.py` 生成（合并五池+watchlist.csv，去重，
@@ -100,6 +136,17 @@
 - R1 进场过滤（所有买入信号，各池通用）：60m 上穿命中时检查 30m/15m/5m，任一周期
   处于下行段（fish < trigger）→ bar_state=假性失效，推送标注「待激活」并写入
   esi_pending（`esi_register_pending`，--once 与 run_scan 都挂钩）。
+- **穿越幅度门槛（2026-09-22 起，仅 executor_v2）**：新鲜 60m 上穿必须
+  fish60 ≥ trigger + 0.15（MIN_CROSS），贴线穿越直接跳过。实证依据
+  backtest_entry_filter.py（854 票 2.3 万信号：贴线≤0.05 桶 HSSR 27~35%
+  vs 深穿 0.2~0.5 桶 52~53%，单调有效）。高位 fish60 / 60m MACD 红柱缩短
+  两项假设均不被数据支持（高位桶收益不差；红柱缩短剥掉贴线后无差异），未采纳。
+  R2 再激活路径不受 MIN_CROSS 约束。
+- **尾盘禁入（2026-09-22 起，executor_v2 ENTRY_TO='14:40'）**：14:40 后不再
+  开新仓（15:00 bar 信号是最差时段桶，ret10 −0.4~−0.7%、HSSR 38~44%），
+  与 executor_t0 的 ENTRY_TO 对齐。已有持仓的离场监控不受影响。
+- **台账新增 entry_delta 列（2026-09-22 起）**：进场时穿越幅度（fisher−trigger），
+  旧行读入自动补空；攒数后用于校准 MIN_CROSS。
 - R2 信号激活：pending 票由持仓任务每 5 分钟复查（`check_pending_activation`）：
   三周期在信号后都重新上穿过且当前 fish > trigger，且 60m fish > trigger（趋势未破坏）
   → 推送「信号激活」并台账记 open（entry_time=激活时刻）；60m fish < trigger → void 作废。
@@ -136,10 +183,16 @@
   当天验证：19:05/19:15 两轮 refresh_kline verify 双失败（数据停昨日），
   用户手动下载后 20:15 同脚本 VERIFY 立刻 OK。**verify 失败时应先检查客户端
   是否做过盘后下载**，而不是反复重试 refresh_kline。
-- `fisher_持仓` 每天 9:31–15:20 每 5 分钟 → scan_holdings.cmd
+- **盘中扫描已暂停（2026-09-22 用户决定，数据源难以获取）**：fisher_持仓 +
+  fisher_扫描1001/1101/1331/1431/1031/1131/1401/1501 共 9 个任务已 schtasks 禁用
+  （未删除，PowerShell `Enable-ScheduledTask -TaskName <名>` 恢复）。
+  保留运行：fisher_建池（17:00 盘后一条龙出候选）、fisher_日共振（15:10）、
+  fisher_HSSR周报、stockdb_盘后同步——即只做盘后候选分析。
+  QMT 两个执行器（钓鱼/高频T0）在客户端内独立运行，不在本次暂停范围。
+- `fisher_持仓` 每天 9:31–15:20 每 5 分钟 → scan_holdings.cmd **【已禁用】**
   （daily 任务，周末由 run_scan.py 内的 weekday 保护直接退出；节假日空跑但不会重复推送，去重兜底）
-- `fisher_扫描1001/1101/1331/1431` 周一~周五 → scan_mid.cmd（bar 中段，--live 盘中信号）
-- `fisher_扫描1031/1131/1401/1501` 周一~周五 → scan_all.cmd（bar 收盘后，完结确认）
+- `fisher_扫描1001/1101/1331/1431` 周一~周五 → scan_mid.cmd（bar 中段，--live 盘中信号）**【已禁用】**
+- `fisher_扫描1031/1131/1401/1501` 周一~周五 → scan_all.cmd（bar 收盘后，完结确认）**【已禁用】**
 - `fisher_日共振` 周一~周五 15:10 → scan_daily.cmd（深水池日共振收盘复核）
 - **盘中扫描时段保护（2026-09-17 起，run_scan.py main）**：持仓/中段/完结确认类扫描
   仅在 09:25–15:30 执行，其余时刻记日志退出；日共振允许补跑到 18:00；
@@ -293,6 +346,27 @@
     非名单票的分钟级判定都要先确认数据含当日 bar，勿信补取成功。**
     注：节假日（工作日但休市）该新鲜度校验会让分钟取数全部返回 None，
     扫描走失败率兜底而非拿旧数据出信号，属预期行为。
+15. **交易会话未登录时 passorder 静默丢单**（2026-09-22 实发）：行情登录与交易登录
+    是两个会话，行情/持仓查询（get_position）正常不代表能下单。交易会话掉线时
+    passorder 照常返回 ret=0，无成交、**无委托记录**，执行器按"已报单"记 sim 账本
+    形成幽灵持仓（次日 STALE 会发必失败的卖单，需手动清 sim_pos.csv）。
+    判据：下单后下一根 bar 持仓仍带 `(sim)` 标记 = 大概率未成交；
+    实锤看 `userdata/log/XtClient_<日期>.log` 里 passorder 行的 msg——
+    正常是「股票买入/卖出」，丢单是「存在未登录的账号, 不能下单!」。
+    修复：客户端交易面板重新登录交易账号（8891080156），两个执行器共用该会话。
+    **同日更深一层**：会话半死时客户端 msg 显示「接受」但报单同样到不了柜台，
+    连「未登录」提示都没有——ret=0 和「接受」都不是成交证据。
+    对策（2026-09-22 已实装，executor_v2/executor_t0 同款）：报单后下一根 bar
+    用 strict_position（查询失败返回 None 则跳过本轮，绝不在不可信数据上重报）
+    核对成交，未成交自动重报一次，仍失败则撤 sim 幽灵账 + 企业微信告警
+    （wecom_alert，stdlib urllib 读 webhook.key）；VERIFY 挂起期间该票不发新单。
+16. **T+1 冻结期的卖出信号曾被静默丢弃（2026-09-23 实发，600498 浮亏 −3.5% 仓位悬空）**：
+    executor_v2 原逻辑先查 `sellable<=0` 直接 `continue`，cross_down/ESI 判断在后面
+    永远走不到——日志写 "exits deferred" 实为 discarded；解冻后序列已单边下行，
+    无新拐点可触发，卖出机制失效。修法（已实装）：冻结期仍评估卖出条件，命中写入
+    持久化台账 `D:\qmt\exdef.csv`（EXDEF：code,reason），可卖首根 bar 立即市价执行
+    （reason=DEFER_EXIT_A/DEFER_ESI，走 VERIFY 成交校验）；pos==0 时清理 stale 项。
+    注意 PSELL（浮盈延迟确认）仍是内存态重启即丢，靠新 cross 重建。
 
 ## 常用操作
 

@@ -952,8 +952,8 @@ def _save_list(filename, df):
 # 浮亏（现价 < 进场价）→ 推送「Fisher失效」卖出预警，failed=是 closed；
 # 浮盈 → 继续持有等 60m 下穿（持仓 down 扫描挂钩记 failed=否 closed）。
 # HSSR 口径不变：failed=亏损卖出，成功=60m 下穿正常离场。
-ESI_COLUMNS = ["code", "entry_time", "entry_price", "entry_fisher60", "fail_time",
-               "fail_fisher30", "failed", "bars_held", "status"]
+ESI_COLUMNS = ["code", "entry_time", "entry_price", "entry_fisher60", "entry_delta",
+               "fail_time", "fail_fisher30", "failed", "bars_held", "status"]
 ESI_PENDING_COLUMNS = ["code", "name", "signal_time", "bar_time", "fisher60",
                        "price", "small_tf", "status"]
 
@@ -966,6 +966,8 @@ def load_esi_ledger():
         df = pd.read_csv(ESI_LEDGER, dtype={"code": str})
         if "entry_price" not in df.columns:   # 旧台账兼容：补列
             df["entry_price"] = np.nan
+        if "entry_delta" not in df.columns:  # 旧台账兼容：穿越幅度（fisher-trigger）
+            df["entry_delta"] = np.nan
         for col in ("entry_time", "fail_time", "failed", "status"):
             if col in df.columns:
                 df[col] = df[col].astype(object).where(df[col].notna(), "")
@@ -1080,6 +1082,7 @@ def check_pending_activation(now=None):
                 "code": code, "entry_time": now.strftime("%Y-%m-%d %H:%M:%S"),
                 "entry_price": float(pd.to_numeric(df60["收盘"], errors="coerce").iloc[-1]),
                 "entry_fisher60": round(float(fish60[-1]), 3),
+                "entry_delta": round(float(fish60[-1]) - float(fish60[-2]), 3),
                 "fail_time": "", "fail_fisher30": "",
                 "failed": "", "bars_held": 0, "status": "open",
             }])], ignore_index=True)
@@ -1129,6 +1132,7 @@ def esi_register_entries(hits):
             "code": code, "entry_time": str(r["bar_time"]),
             "entry_price": float(r.get("close", np.nan)),
             "entry_fisher60": round(fisher, 3),
+            "entry_delta": round(fisher - float(r.get("trigger", fisher)), 3),
             "fail_time": "", "fail_fisher30": "",
             "failed": "", "bars_held": 0, "status": "open",
         }])], ignore_index=True)

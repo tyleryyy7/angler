@@ -1,4 +1,4 @@
-﻿$src = 'D:\angler\executor_v2.py'
+$src = 'D:\angler\executor_v2.py'
 $dst = 'D:\国金证券QMT交易端\python\钓鱼.py'
 $bakdir = 'D:\国金证券QMT交易端\python\backups'
 
@@ -15,4 +15,18 @@ if (Test-Path $dst) {
 }
 Copy-Item $src $dst -Force
 Write-Host "[OK] synced $src -> $dst  (backup: $bakdir\executor_v2_$ts.py)"
+
+$src2 = 'D:\angler\executor_t0.py'
+$dst2 = 'D:\国金证券QMT交易端\python\高频T0.py'
+
+$bytes2 = [System.IO.File]::ReadAllBytes($src2)
+if ($bytes2 | Where-Object { $_ -ge 128 } | Select-Object -First 1) {
+    Write-Host "[ABORT] $src2 contains non-ASCII bytes. QMT requires pure ASCII source."
+    exit 1
+}
+if (Test-Path $dst2) {
+    Copy-Item $dst2 (Join-Path $bakdir "executor_t0_$ts.py")
+}
+Copy-Item $src2 $dst2 -Force
+Write-Host "[OK] synced $src2 -> $dst2  (backup: $bakdir\executor_t0_$ts.py)"
 Write-Host "NOTE: restart the strategy in QMT client to load the new version."
