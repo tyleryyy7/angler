@@ -274,6 +274,7 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                         'f60': pos[4],
                         'branch': pos[6] if len(pos) > 6 else None,
                         'delta': pos[7] if len(pos) > 7 else None,
+                        'path': pos[8] if len(pos) > 8 else None,
                         'eday': pos[3]})
                     for lt in lots:
                         lg = (price - lt[1]) * lt[2]
@@ -285,7 +286,8 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                             'reason': reason + '|ADD', 'vol': lt[2],
                             'bars': g - lt[0], 'g_exit': g,
                             'hold_days': (day != lt[3]), 'f60': lt[4],
-                            'branch': None, 'delta': lt[6], 'eday': lt[3]})
+                            'branch': None, 'delta': lt[6], 'path': 'ADD',
+                            'eday': lt[3]})
                     pos = None
                     psell = None
                     lots = []
@@ -318,7 +320,7 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                         pos = [g, price, vol, day, f60, hhmm,
                                (('TREND' if rg_T else 'FALL')
                                 if variant == 'G_REGIME_ESI' else None),
-                               f60 - t60]
+                               f60 - t60, 'R2']
                         pending = None
                         lots = []
                         last_buy_key = key1h
@@ -344,7 +346,7 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
             pos = [g, price, vol, day, f60, hhmm,
                    (('TREND' if rg_T else 'FALL')
                     if variant == 'G_REGIME_ESI' else None),
-                   f60 - t60]
+                   f60 - t60, 'DIRECT']
             lots = []
             last_buy_key = key1h
     # 数据末尾仍持仓：盯市平仓
@@ -361,6 +363,7 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
             'g_exit': len(b5) - 1,
             'branch': pos[6] if len(pos) > 6 else None,
             'delta': pos[7] if len(pos) > 7 else None,
+            'path': pos[8] if len(pos) > 8 else None,
             'hold_days': True,
             'f60': pos[4], 'eday': pos[3]})
         for lt in lots:
@@ -373,7 +376,7 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                 'gross': lg, 'fee': lf, 'net': lg - lf,
                 'reason': 'END|ADD', 'vol': lt[2], 'bars': len(b5) - 1 - lt[0],
                 'g_exit': len(b5) - 1,
-                'branch': None, 'delta': lt[6],
+                'branch': None, 'delta': lt[6], 'path': 'ADD',
                 'hold_days': True, 'f60': lt[4], 'eday': lt[3]})
     return trades
 

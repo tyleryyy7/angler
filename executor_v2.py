@@ -465,7 +465,11 @@ def verify_fills(ContextInfo):
             else:
                 simpos_on_sell(code)           # phantom entry, never really bought
         if side == 'BUY' and tag == 'ADD' and pos <= base:
-            ADDS[code] = max(0, ADDS.get(code, 1) - 1)   # 失败不占加仓名额
+            left = max(0, ADDS.get(code, 1) - 1)   # 失败不占加仓名额
+            if left:
+                ADDS[code] = left
+            else:
+                ADDS.pop(code, None)
             adds_save()
         msg = ('QMT FILL FAIL: %s %s x%d not filled after retry '
                '(pos %d, base %d), manual check needed'
@@ -713,9 +717,10 @@ def eff_position(ContextInfo, code):
 def simpos_on_buy(ContextInfo, code, vol, price):
     old = SIM_POS.get(code)
     if old:
-        # pyramid add on a sim position: accumulate with weighted cost,
-        # keep the first buy date (T+1 sellability of the new lot is
-        # conservative - the whole sim row freezes again today)
+        # pyramid add on a sim position: accumulate with weighted cost, and
+        # re-stamp buy_date to today - the whole sim row freezes again today
+        # (conservative: the old lot is technically sellable, but the row
+        # model has one date; freezing all is the safe direction)
         tv, tc = old[0] + vol, (old[0] * old[1] + vol * price) / (old[0] + vol)
         SIM_POS[code] = [tv, tc, bar_date(ContextInfo)]
     else:

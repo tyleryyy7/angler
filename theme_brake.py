@@ -29,8 +29,11 @@ PARAMS = dict(variant='E_NOESI', min_cross=0.0, max_f60=1.0,
               min_cross_sell=0.50)          # REV 2026-10-05b 线上规则
                                             # （max_f60=1.0 近似 SZ4 的 f60>=1 跳过；
                                             # 分档倍率/加仓在刹车评估里从简）
-MIN_TRADES = 5                              # 窗口内笔数下限（少于则样本不足不判）
-FETCH_COUNTS = {'5m': 4500, '15m': 1600, '30m': 900, '1h': 600, '1d': 150}
+MIN_TRADES = 4                              # 窗口内笔数下限（少于则样本不足不判）
+DEFAULT_DAYS = 126                          # trailing 窗口（交易日）。新规则单笔
+                                            # 数减半，63 日窗口会让 11/12 票样本不足
+                                            # （2026-10-05 实测），改 126 日
+FETCH_COUNTS = {'5m': 7000, '15m': 2400, '30m': 1300, '1h': 900, '1d': 200}
 
 
 def load_watchlist():
@@ -82,10 +85,49 @@ def judge(codes, days):
     return rows, cutoff
 
 
+def drift_scan(days):
+    """参数漂移月报：池并集（右/左/深水）trailing 窗口重扫卖门槛档位，
+    报告当前线上档位是否仍然最优。纯分析，不改任何行为。"""
+    import backtest_t0_replay as t0
+    import backtest_v2_replay as br
+    codes = []
+    for fn in ('pool_right.csv', 'pool_left.csv', 'pool_deep.csv'):
+        p = BASE / fn
+        if not p.exists():
+            continue
+        import csv as _csv
+        with open(p, encoding='utf-8-sig') as f:
+            for row in _csv.DictReader(f):
+                c = (row.get('code') or '').strip()
+                if c and c not in codes:
+                    codes.append(c)
+    codes = [c for c in codes
+             if all((DATA_DIR / ('%s_%s.csv' % (c, p))).exists()
+                    for p in ('5m', '15m', '30m', '1h'))]
+    if not codes:
+        return None
+    refresh(codes)
+    sweep = [0.25, 0.35, 0.50, 0.75]
+    totals = {x: [0, 0.0] for x in sweep}
+    for code in codes:
+        b5 = t0.load_bars(code, '5m')
+        cal = sorted({b['time'][:10] for b in b5})
+        cutoff = cal[-days] if len(cal) > days else cal[0]
+        for smc in sweep:
+            kw = dict(PARAMS)
+            kw['min_cross_sell'] = smc
+            ts = [t for t in br.replay(code, **kw) if t['eday'] >= cutoff]
+            totals[smc][0] += len(ts)
+            totals[smc][1] += sum(t['net'] for t in ts)
+    cur = PARAMS['min_cross_sell']
+    best = max(sweep, key=lambda x: totals[x][1])
+    return sweep, totals, cur, best, len(codes), cutoff
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--no-push', action='store_true')
-    ap.add_argument('--days', type=int, default=63)
+    ap.add_argument('--days', type=int, default=DEFAULT_DAYS)
     args = ap.parse_args()
 
     codes = load_watchlist()
@@ -112,6 +154,24 @@ def main():
     msg.append('')
     msg.append('刹车 %d 只：%s' % (len(blocked),
                                   ' '.join(r[0] for r in blocked) or '无'))
+    # 参数漂移：池并集 trailing 重扫卖门槛（纯报告）
+    try:
+        d = drift_scan(args.days)
+        if d:
+            sweep, totals, cur, best, ncodes, dcut = d
+            msg.append('')
+            msg.append('**参数漂移**（池并集 %d 只，卖门槛 trailing 净额）' % ncodes)
+            for x in sweep:
+                n, net = totals[x]
+                mark = ' ←线上' if abs(x - cur) < 1e-9 else (
+                    ' ←当期最优' if x == best and x != cur else '')
+                msg.append('%.2f：%d 笔 %+.0f%s' % (x, n, net, mark))
+            if abs(best - cur) > 1e-9:
+                msg.append('⚠️ 线上档 %.2f 非当期最优（最优 %.2f），关注但勿自动改'
+                           % (cur, best))
+    except Exception as e:
+        msg.append('')
+        msg.append('（参数漂移扫描失败：%s）' % e)
     text = '\n'.join(msg)
     print(text)
     if not args.no_push:
