@@ -100,11 +100,17 @@ CONFIG_FILE = r'D:\qmt\v2_config.txt'   # optional KEY=VALUE lines, whitelisted:
                                         #   SELL_MC_STOCK / SELL_MC_ETF (float)
                                         #   USE_ADDS=0|1, MAX_ADDS (int),
                                         #   ADD_PCT (float)
+                                        #   GLOBAL_SCALE (float, 全局降档乘数)
+                                        #   DRES_BOOST=0|1 (日共振加成, 默认关)
+DRES_BOOST = False             # 当日日K共振（dres）进场倍率 +1（封顶 3x）。
+                               # 验证 2026-10-05：共振日 +4.45%/笔 vs 非共振
+                               # +2.76%/笔（S050 基座）、旧 LIVE 3.4 倍。
+GLOBAL_SCALE = 1.0             # 组合层降档：所有下单量乘此系数（人工/报告驱动）
 BLOCKLIST_FILE = r'D:\qmt\v2_blocklist.txt'  # 动态刹车名单（theme_brake.py 每月
                                         # 生成）：一行一个 code，名单内票只管理
                                         # 卖出、不进新仓（含加仓）。每 handlebar 热读。
 BLOCKLIST = set()
-REV = '2026-10-05b'              # bumped on every repo edit; printed in the start
+REV = '2026-10-05c'              # bumped on every repo edit; printed in the start
                                  # banner so the deployed copy's version is always
                                  # identifiable from the client log (a stale paste
                                  # once ran silently for a whole day)
@@ -156,6 +162,80 @@ def fisher_series(high, low, length):
         fish = 0.5 * math.log((1.0 + v) / (1.0 - v)) + 0.5 * fish
         out.append(fish)
     return out
+
+
+def fisher_series_v(high, low, length):
+    # same recursion as fisher_series, also returns the value series (needed
+    # to extend the series by one forming bar - dres_today)
+    n = len(high)
+    hl2 = [(high[i] + low[i]) / 2.0 for i in range(n)]
+    value = 0.0
+    fish = 0.0
+    out = []
+    vals = []
+    for i in range(n):
+        s = max(0, i - length + 1)
+        hh = max(hl2[s: i + 1])
+        ll = min(hl2[s: i + 1])
+        div = (hh - ll) if hh != ll else 1.0
+        v = 0.66 * ((hl2[i] - ll) / div - 0.5) + 0.67 * value
+        if v > 0.99:
+            v = 0.999
+        elif v < -0.99:
+            v = -0.999
+        value = v
+        fish = 0.5 * math.log((1.0 + v) / (1.0 - v)) + 0.5 * fish
+        out.append(fish)
+        vals.append(v)
+    return out, vals
+
+
+def get_hist_ts(ContextInfo, code, period, field):
+    # like get_hist but also returns per-bar dates (yyyymmdd strings).
+    # Needed to tell whether the last daily bar is the forming one.
+    try:
+        d = ContextInfo.get_market_data_ex_ori([field], [code], period=period,
+                                               count=HIST_BARS,
+                                               dividend_type='none',
+                                               fill_data=True, subscribe=True)
+        data = d.get(code) if isinstance(d, dict) else None
+        if data is None and isinstance(d, dict) and len(d) == 1:
+            data = list(d.values())[0]
+        if isinstance(data, dict):
+            vals = data.get(field)
+            sts = data.get('stime') or []
+            if vals:
+                vals = [float(x) for x in list(vals)[-HIST_BARS:]]
+                dates = [_ts_day(x) for x in list(sts)[-HIST_BARS:]]
+                if len(dates) != len(vals):
+                    dates = [''] * len(vals)
+                return vals, dates
+        elif data:
+            rows = sorted(data, key=lambda r: r[0])
+            rows = rows[-HIST_BARS:]
+            return ([float(r[-1]) for r in rows],
+                    [_ts_day(r[0]) for r in rows])
+    except Exception as e:
+        print('[WARN] %s %s hist_ts failed: %s' % (code, period, e))
+    return [], []
+
+
+def _ts_day(x):
+    # stime -> 'yyyymmdd'; accepts 'yyyyMMddHHMMSS', 'yyyyMMdd',
+    # 'yyyy-MM-dd HH:MM:SS', or epoch seconds/milliseconds
+    try:
+        s = str(x)
+        if s.isdigit():
+            if len(s) >= 12:
+                return s[:8]                  # yyyymmddHHMMSS
+            if len(s) == 8 and s[:2] in ('19', '20'):
+                return s                      # yyyymmdd
+            ts = int(s)                       # epoch (s or ms)
+            return time.strftime('%Y%m%d',
+                                 time.localtime(ts / 1000 if ts > 1e12 else ts))
+        return s.replace('-', '').replace(' ', '').replace(':', '')[:8]
+    except Exception:
+        return ''
 
 
 def get_hist(ContextInfo, code, period, field):
@@ -286,7 +366,42 @@ def sell_mc(code):
     return SELL_MC_ETF if is_etf(code) else SELL_MC_STOCK
 
 
-def entry_mult(code, f60, hhmm):
+def dres_today(ContextInfo, code):
+    # 当日日K共振：完结日线 + 当日形成中（5m 合成的当日高/低）fisher 由跌转升，
+    # 与回放 entry_daily='dres' 同口径。只在进场判定瞬间调用（低开销路径外）。
+    try:
+        hh, dd = get_hist_ts(ContextInfo, code, '1d', 'high')
+        ll, _ = get_hist_ts(ContextInfo, code, '1d', 'low')
+        today = bar_date(ContextInfo)
+        if dd and dd[-1] == today:
+            hh, ll = hh[:-1], ll[:-1]          # 去掉形成中日线
+        if len(hh) < 11 or len(hh) != len(ll):
+            return False
+        fv, vv = fisher_series_v(hh, ll, LENGTH)
+        h5, d5 = get_hist_ts(ContextInfo, code, '5m', 'high')
+        l5, d5l = get_hist_ts(ContextInfo, code, '5m', 'low')
+        thi = [x for x, dx in zip(h5, d5) if dx == today]
+        tlo = [x for x, dx in zip(l5, d5l) if dx == today]
+        if not thi or not tlo:
+            return False
+        hl2c = [(hh[i] + ll[i]) / 2.0 for i in range(len(hh))]
+        hl2_t = (max(thi) + min(tlo)) / 2.0
+        win = hl2c[max(0, len(hl2c) - 8):] + [hl2_t]   # 完结 8 根 + 当日 = 9
+        hh9, ll9 = max(win), min(win)
+        div = (hh9 - ll9) if hh9 != ll9 else 1.0
+        v = 0.66 * ((hl2_t - ll9) / div - 0.5) + 0.67 * vv[-1]
+        if v > 0.99:
+            v = 0.999
+        elif v < -0.99:
+            v = -0.999
+        f_t = 0.5 * math.log((1.0 + v) / (1.0 - v)) + 0.5 * fv[-1]
+        return f_t > fv[-1] and fv[-1] <= fv[-2]
+    except Exception as e:
+        print('[WARN] %s dres failed: %s' % (code, e))
+        return False
+
+
+def entry_mult(code, f60, hhmm, dres=False):
     # SZ4 sizing, stocks only (ETF evidence weak, stay 1x). 0.0 = skip entry.
     if is_etf(code) or not SZ4_SIZING:
         return 1.0
@@ -295,11 +410,13 @@ def entry_mult(code, f60, hhmm):
     m = 2.0 if f60 < 0.0 else 1.0
     if hhmm >= '13:00':
         m *= 0.5
+    if dres:
+        m = min(m + 1.0, 3.0)      # 日共振加成一档（封顶 3 单位）
     return m
 
 
 def sized_vol(code, mult):
-    v = int(VOL_MAP.get(code, VOLUME) * mult / 100.0) * 100
+    v = int(VOL_MAP.get(code, VOLUME) * mult * GLOBAL_SCALE / 100.0) * 100
     return max(v, 0)
 
 
@@ -383,7 +500,8 @@ def config_override():
                 if new != ETF_ENTRIES:
                     print('[CONFIG] ETF_ENTRIES %s -> %s' % (ETF_ENTRIES, new))
                     ETF_ENTRIES = new
-            elif k in ('SELL_MC_STOCK', 'SELL_MC_ETF', 'ADD_PCT'):
+            elif k in ('SELL_MC_STOCK', 'SELL_MC_ETF', 'ADD_PCT',
+                       'GLOBAL_SCALE'):
                 try:
                     globals()[k] = float(v)
                 except ValueError:
@@ -395,6 +513,8 @@ def config_override():
                     pass
             elif k == 'USE_ADDS':
                 globals()['USE_ADDS'] = v not in ('0', 'false', 'False', 'no')
+            elif k == 'DRES_BOOST':
+                globals()['DRES_BOOST'] = v not in ('0', 'false', 'False', 'no')
         f.close()
     except Exception:
         pass
@@ -756,10 +876,11 @@ def init(ContextInfo):
     ADDS = adds_load()
     SIM_POS = simpos_load()
     ContextInfo.set_universe(CODES)
-    print('=== qmt_executor_v2 rev=%s start, account=%s codes=%d vol=%d gate=%s exit_a=%s esi_exit=%s sell_gate=%s sell_mc=%.2f/%.2f sizing=%s adds=%s(%.2f%%,x%d) etf_entries=%s t0=%d blocklist=%d backtest=%s pending=%s sim_pos=%s ==='
+    print('=== qmt_executor_v2 rev=%s start, account=%s codes=%d vol=%d gate=%s exit_a=%s esi_exit=%s sell_gate=%s sell_mc=%.2f/%.2f sizing=%s dres_boost=%s scale=%.2f adds=%s(%.2f%%,x%d) etf_entries=%s t0=%d blocklist=%d backtest=%s pending=%s sim_pos=%s ==='
           % (REV, acc_id(ContextInfo), len(CODES), VOLUME, USE_ENTRY_GATE, USE_EXIT_A,
              (USE_ESI_EXIT and 'stock-off/etf-on' or 'off'), '/'.join(EXIT_CONFIRM_TFS),
-             SELL_MC_STOCK, SELL_MC_ETF, SZ4_SIZING, USE_ADDS, ADD_PCT * 100, MAX_ADDS,
+             SELL_MC_STOCK, SELL_MC_ETF, SZ4_SIZING, DRES_BOOST, GLOBAL_SCALE,
+             USE_ADDS, ADD_PCT * 100, MAX_ADDS,
              ETF_ENTRIES,
              len(T0_SET), len(BLOCKLIST), getattr(ContextInfo, 'do_back_test', False),
              list(PENDING.keys()), SIM_POS))
@@ -862,7 +983,9 @@ def handlebar(ContextInfo):
                       % (bar_key, code, f60 - t60, MIN_CROSS_ENTRY))
             mult = 1.0
             if cross_up:
-                mult = entry_mult(code, f60, bar_dt(ContextInfo)[11:16])
+                dres = DRES_BOOST and not is_etf(code) \
+                    and dres_today(ContextInfo, code)
+                mult = entry_mult(code, f60, bar_dt(ContextInfo)[11:16], dres)
                 if mult <= 0.0:
                     cross_up = False
                     print('[SKIP] %s %s SZ4 sizing: fish60=%.3f >= 1.0, entry skipped'
@@ -919,7 +1042,9 @@ def handlebar(ContextInfo):
             if ups:
                 if LAST_ACT.get((code, 'BUY')) == key1h:
                     continue
-                mult = entry_mult(code, f60, bar_dt(ContextInfo)[11:16])
+                dres = DRES_BOOST and not is_etf(code) \
+                    and dres_today(ContextInfo, code)
+                mult = entry_mult(code, f60, bar_dt(ContextInfo)[11:16], dres)
                 if mult <= 0.0:
                     print('[SKIP] %s %s SZ4 sizing at reactivation: fish60=%.3f, skipped'
                           % (bar_key, code, f60))

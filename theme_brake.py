@@ -158,6 +158,14 @@ def main():
     msg.append('')
     msg.append('刹车 %d 只：%s' % (len(blocked),
                                   ' '.join(r[0] for r in blocked) or '无'))
+    # 组合层：watchlist 整体 trailing 净额（报告级，人工决定是否全局降档）
+    wl_net = sum(r[2] for r in rows)
+    wl_n = sum(r[1] for r in rows)
+    msg.append('')
+    msg.append('**组合层**：watchlist 合计 %d 笔 %+.0f%s'
+               % (wl_n, wl_net,
+                  ' ⚠️ 组合 trailing 转负，可考虑 v2_config.txt 加 GLOBAL_SCALE=0.5 全局降档'
+                  if wl_net < 0 and wl_n >= 10 else ''))
     # 参数漂移：池并集 trailing 重扫卖门槛（纯报告）
     try:
         d = drift_scan(args.days)

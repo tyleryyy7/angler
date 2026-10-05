@@ -149,7 +149,9 @@ def small_tf_down(tf, bars, i, day, m, winc):
 def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
            esi_min_loss=0.0, min_cross=MIN_CROSS, max_f60=999.0,
            min_cross_sell=None, add_pct=None, max_adds=2, add_regime=None,
-           t0=False, entry_regime=None, entry_daily=None):
+           t0=False, entry_regime=None, entry_daily=None, add_t1=False):
+    # add_t1=True: 加仓笔遵守 T+1——当日加仓笔在出场当日不可卖，主仓卖出后
+    # 冻结的加仓笔合并为独立仓位继续走出场逻辑（path=ADD-CONT）。
     # entry_daily='dres': 进场当日日 K 共振——用盘中已见高/低合成形成中日线的
     # fisher，当日日级「由跌转升」拐点才许进场（与扫描器深水日共振同口径的
     # 盘中近似：完结日线序列 + 当日形成中一根）。
@@ -306,7 +308,11 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                         'delta': pos[7] if len(pos) > 7 else None,
                         'path': pos[8] if len(pos) > 8 else None,
                         'eday': pos[3]})
+                    frozen = []
                     for lt in lots:
+                        if add_t1 and not t0 and lt[3] == day:
+                            frozen.append(lt)      # 当日加仓笔 T+1 冻结
+                            continue
                         lg = (price - lt[1]) * lt[2]
                         lf = fee_buy(lt[1], lt[2]) + fee_sell(price, lt[2])
                         trades.append({
@@ -318,9 +324,16 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                             'hold_days': (day != lt[3]), 'f60': lt[4],
                             'branch': None, 'delta': lt[6], 'path': 'ADD',
                             'eday': lt[3]})
-                    pos = None
                     psell = None
                     lots = []
+                    if frozen:
+                        # 冻结加仓笔合并为独立仓位，继续走出场逻辑
+                        fv = sum(lt[2] for lt in frozen)
+                        fc = sum(lt[1] * lt[2] for lt in frozen) / fv
+                        pos = [frozen[0][0], fc, fv, day, frozen[0][4],
+                               hhmm, None, frozen[0][6], 'ADD-CONT']
+                    else:
+                        pos = None
                 elif (add_pct is not None and len(lots) < max_adds
                         and ENTRY_FROM <= hhmm <= ENTRY_TO
                         and price >= pos[1] * (1.0 + add_pct)
