@@ -109,10 +109,13 @@ def drift_scan(days):
     refresh(codes)
     sweep = [0.25, 0.35, 0.50, 0.75]
     totals = {x: [0, 0.0] for x in sweep}
+    per_code = {}                   # code -> (n, net) under 线上 PARAMS
     for code in codes:
         b5 = t0.load_bars(code, '5m')
         cal = sorted({b['time'][:10] for b in b5})
         cutoff = cal[-days] if len(cal) > days else cal[0]
+        ts0 = [t for t in br.replay(code, **PARAMS) if t['eday'] >= cutoff]
+        per_code[code] = (len(ts0), sum(t['net'] for t in ts0))
         for smc in sweep:
             kw = dict(PARAMS)
             kw['min_cross_sell'] = smc
@@ -121,7 +124,7 @@ def drift_scan(days):
             totals[smc][1] += sum(t['net'] for t in ts)
     cur = PARAMS['min_cross_sell']
     best = max(sweep, key=lambda x: totals[x][1])
-    return sweep, totals, cur, best, len(codes), cutoff
+    return sweep, totals, cur, best, len(codes), cutoff, per_code
 
 
 def main():
@@ -131,6 +134,7 @@ def main():
     args = ap.parse_args()
 
     codes = load_watchlist()
+    codes_wl = list(codes)
     print('watchlist %d 只，trailing %d 个交易日' % (len(codes), args.days))
     refresh(codes)
     rows, cutoff = judge(codes, args.days)
@@ -158,7 +162,7 @@ def main():
     try:
         d = drift_scan(args.days)
         if d:
-            sweep, totals, cur, best, ncodes, dcut = d
+            sweep, totals, cur, best, ncodes, dcut, per_code = d
             msg.append('')
             msg.append('**参数漂移**（池并集 %d 只，卖门槛 trailing 净额）' % ncodes)
             for x in sweep:
@@ -169,6 +173,17 @@ def main():
             if abs(best - cur) > 1e-9:
                 msg.append('⚠️ 线上档 %.2f 非当期最优（最优 %.2f），关注但勿自动改'
                            % (cur, best))
+            # 名单建议：池中 trailing 最强且不在 watchlist 的 TOP5 +
+            # watchlist 中最弱的（人工确认，不自动换）
+            wl = set(codes_wl)
+            cands = sorted(((n, net, c) for c, (n, net) in per_code.items()
+                            if c not in wl and n >= MIN_TRADES and net > 0),
+                           key=lambda x: -x[1])[:5]
+            if cands:
+                msg.append('')
+                msg.append('**名单建议**（人工确认）')
+                msg.append('候选换入：' + ' '.join('%s(%d笔%+0.0f)' % (c, n, net)
+                                                 for n, net, c in cands))
     except Exception as e:
         msg.append('')
         msg.append('（参数漂移扫描失败：%s）' % e)

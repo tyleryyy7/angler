@@ -149,7 +149,10 @@ def small_tf_down(tf, bars, i, day, m, winc):
 def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
            esi_min_loss=0.0, min_cross=MIN_CROSS, max_f60=999.0,
            min_cross_sell=None, add_pct=None, max_adds=2, add_regime=None,
-           t0=False, entry_regime=None):
+           t0=False, entry_regime=None, entry_daily=None):
+    # entry_daily='dres': 进场当日日 K 共振——用盘中已见高/低合成形成中日线的
+    # fisher，当日日级「由跌转升」拐点才许进场（与扫描器深水日共振同口径的
+    # 盘中近似：完结日线序列 + 当日形成中一根）。
     # add_pct: 顺势加仓开关（验证用近似口径）。持仓浮盈 >= add_pct 且盘中再出
     # 1h 上穿（同一 1h 窗口不重复）→ 加 1 单位，最多 max_adds 次；加仓笔随主仓
     # 同价离场、单独记账（reason 带 |ADD），T+1 对加仓笔当日不可卖的细节忽略。
@@ -170,6 +173,28 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
             load_bars(code, '1d'),
             regime_mode if variant == 'G_REGIME_ESI'
             else (add_regime or entry_regime))
+    if entry_daily == 'dres':
+        import math as _math
+        d1 = load_bars(code, '1d')
+        d_dates = [x['time'][:10] for x in d1]
+        d_hl2 = [(x['h'] + x['l']) / 2.0 for x in d1]
+        d_fish, d_val = fisher_series_v([x['h'] for x in d1],
+                                        [x['l'] for x in d1])
+
+        def dres_at(day, hi, lo):
+            """当日形成中日线是否处于日级「由跌转升」拐点（无前视）。"""
+            j = bisect_left(d_dates, day) - 1
+            if j < 2:
+                return False
+            hl2_t = (hi + lo) / 2.0
+            s = max(0, j - 7)
+            hh = max(d_hl2[s:j + 1] + [hl2_t])
+            ll = min(d_hl2[s:j + 1] + [hl2_t])
+            div = (hh - ll) if hh != ll else 1.0
+            v = 0.66 * ((hl2_t - ll) / div - 0.5) + 0.67 * d_val[j]
+            v = 0.999 if v > 0.99 else (-0.999 if v < -0.99 else v)
+            f = 0.5 * _math.log((1.0 + v) / (1.0 - v)) + 0.5 * d_fish[j]
+            return f > d_fish[j] and d_fish[j] <= d_fish[j - 1]
     by_day = defaultdict(list)
     for g, b in enumerate(b5):
         by_day[b['time'][:10]].append((g, b))
@@ -192,6 +217,11 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
             di = bisect_left(rg_dates, day) - 1
             rg_T = di >= 0 and rg_arr[di] == 'TREND'
         esi_off = variant == 'G_REGIME_ESI' and rg_T
+        day_hi = None
+        day_lo = None
+        for i, (g, b) in enumerate(bars):
+            day_hi = b['h'] if day_hi is None else max(day_hi, b['h'])
+            day_lo = b['l'] if day_lo is None else min(day_lo, b['l'])
         for i, (g, b) in enumerate(bars):
             hhmm = b['time'][11:16]
             m = int(hhmm[:2]) * 60 + int(hhmm[3:])
@@ -316,6 +346,9 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                     if None in (d15, d30, d5):
                         continue
                     if not (d15 or d30 or d5):
+                        if entry_daily == 'dres' and not dres_at(
+                                day, day_hi, day_lo):
+                            continue               # 日K 未共振，pending 保留
                         vol = max(100, int(nominal / price / 100.0) * 100)
                         pos = [g, price, vol, day, f60, hhmm,
                                (('TREND' if rg_T else 'FALL')
@@ -327,6 +360,8 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                         continue
             if not cross_up or last_buy_key == key1h:
                 continue
+            if entry_daily == 'dres' and not dres_at(day, day_hi, day_lo):
+                continue                           # 当日日K未共振，不进场
             if entry_regime is not None and not rg_T:
                 continue                           # 动态强弱闸门：非 TREND 日不进场
             if variant != 'B_NOX' and (f60 - t60) < min_cross:
