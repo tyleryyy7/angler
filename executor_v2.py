@@ -3,7 +3,11 @@
 #
 # Entry (R1): 1h fisher cross UP and none of 30m/15m/5m is in down state
 #             (fish < trigger) and no position -> buy VOLUME shares.
-# Exit A    : 1h fisher cross DOWN and position > 0 -> sell all (normal exit).
+# Exit A    : mirrors the entry side: 1h fisher cross DOWN with magnitude
+#             (trigger - fish) >= MIN_CROSS and ALL of 15m/30m/5m in down state
+#             -> sell all. Hairline down-crosses are ignored; small tfs not all
+#             down = fake-invalid exit -> defer + watch, void if 1h fish
+#             recovers above its trigger.
 # Exit B(R3): latest completed 30m bar cross DOWN and current price < cost -> sell all
 #             immediately (failed trade); floating profit -> keep holding for Exit A.
 #
@@ -28,19 +32,50 @@ LENGTH = 9                   # fisher window
 HIST_BARS = 120              # bars fetched per timeframe per call
 VOLUME = 100                 # default shares per BUY order (per-code override in watchlist)
 USE_ENTRY_GATE = True        # R1: small-timeframe resonance gate (30m/15m/5m not down)
-MIN_CROSS = 0.15             # cross magnitude floor: fish60 must exceed trigger by
-                             # at least this (hairline crosses are the worst bucket
-                             # in backtest_entry_filter.py: HSSR 27% vs 52% deep)
+MIN_CROSS = 0.15             # SELL-side magnitude floor only (exit, 09-29b).
+MIN_CROSS_ENTRY = 0.0        # entry floor REMOVED 2026-09-30: thick-sample sweep
+                             # (231 codes x 10.5mo, ESI-off base) monotone -
+                             # 0.00 beats 0.15 by +127k; hairline bucket win rate
+                             # lower (42% vs 46%) but expectancy +0.27%/trade.
+                             # HSSR old study measured win rate only.
+MAX_F60 = 2.5                # entry cap: fish60 >= 2.5 skipped (high-position
+                             # bucket gross negative, 2026 alone -19k; caps
+                             # 1.5/2.0/2.5 statistically tied, 2.5 matches the
+                             # scanner esi_register convention)
 ENTRY_TO = '14:40'           # no fresh entries after this time: 15:00-bar signals
                              # are the worst time bucket (ret10 ~-0.4~-0.7%, HSSR
                              # ~38-44%). Mirrors executor_t0 ENTRY_TO.
+VERIFY_WAIT_SEC = 90         # min seconds between order submit and first fill
+                             # check: handlebar is tick-driven live (~3s), but the
+                             # position query lags the fill push by seconds;
+                             # checking earlier caused phantom retries that
+                             # double/triple-filled (2026-09-28 incident)
 USE_EXIT_A = True            # Exit A: 1h fisher cross down -> sell all (normal exit)
-USE_ESI_EXIT = True          # R3: 30m cross-down + floating loss -> sell immediately
-USE_EXIT_CONFIRM = True      # Exit A defer: floating profit -> wait until all
-                             # EXIT_CONFIRM_TFS are in down state before selling;
-                             # floating loss (or unknown cost/price) sells at once
-EXIT_CONFIRM_TFS = ('15m', '30m', '5m')
-REV = '2026-09-23b'              # bumped on every repo edit; printed in the start
+USE_ESI_EXIT = True          # R3 ESI master switch - per-instrument since
+                             # 2026-09-30: stocks (60/00) OFF (4-layer thick-sample
+                             # evidence: -258k on falling-knife pool, 2026-09-29),
+                             # T0 ETFs ON (+12k, trending instruments).
+                             # See esi_enabled().
+EXIT_CONFIRM_TFS = ('15m', '30m', '5m')   # Exit A sell gate (mirrors the entry
+                             # gate): sell only when ALL these small tfs are in
+                             # down state; otherwise fake-invalid exit -> defer
+                             # + watch (PSELL), void if 1h fish recovers above
+                             # its trigger. Down-crosses thinner than MIN_CROSS
+                             # are ignored entirely (same floor as entries).
+OPEN_GUARD_UNTIL = '09:35'   # no orders before this time: at the 09:30 open the
+                             # forming 1h bar holds a single tick (high==low) and
+                             # cross readings on it are degenerate, and the trade
+                             # session's position cache is still syncing (2026-09-29:
+                             # 3 positions dumped on one-tick cross-downs at
+                             # 09:30:00.5 + a buy fired while a real position was
+                             # invisible to the position query). Mirrors
+                             # executor_t0 STALE_EXIT_AT.
+ETF_ENTRIES = True             # ETF (non 60/00) NEW-ENTRY switch; False = manage
+                             # exits only, no fresh ETF buys. Hot-reloaded from
+                             # CONFIG_FILE every handlebar (no restart needed).
+CONFIG_FILE = r'D:\qmt\v2_config.txt'   # optional KEY=VALUE lines, whitelisted:
+                                        #   ETF_ENTRIES=0|1
+REV = '2026-09-30c'              # bumped on every repo edit; printed in the start
                                  # banner so the deployed copy's version is always
                                  # identifiable from the client log (a stale paste
                                  # once ran silently for a whole day)
@@ -56,10 +91,11 @@ SIM_POS = {}                 # code -> [vol, cost, buy_date], simulation-mode le
                              # real account positions always take precedence
 LAST_PRINT = {}              # code -> last printed 1h fisher key (log throttle)
 MD2_WARNED = set()           # market_data2 empty-result warnings already printed
-PSELL = {}                   # code -> key1h of deferred Exit A (floating profit,
-                             # waiting small-tf confirm; in-memory, lost on restart)
-VERIFY = {}                  # code -> [side, base_pos, vol, tries, tag]: post-order
-                             # fill check next bar; retry once, then WeCom alert
+PSELL = {}                   # code -> key1h of deferred Exit A (sell gate not
+                             # fully down; in-memory, lost on restart)
+VERIFY = {}                  # code -> [side, base_pos, vol, tries, tag, submit_ts]:
+                             # fill check VERIFY_WAIT_SEC after submit; retry the
+                             # missing remainder once, then WeCom alert
 WEBHOOK_KEY_FILE = r'D:\angler\webhook.key'
 EXDEF = {}                   # code -> reason: exit signal latched while T+1-frozen
                              # (persisted; executed as soon as shares are sellable)
@@ -200,6 +236,40 @@ def wecom_alert(msg):
         print('[WARN] wecom alert failed: %s' % e)
 
 
+def is_etf(code):
+    return not code.split('.')[0].startswith(('60', '00'))
+
+
+def esi_enabled(code):
+    # per-instrument ESI switch (thick-sample 2026-09-29/30): harmful on
+    # falling-knife stock pools (-258k), positive on trending T0 ETFs (+12k)
+    if not USE_ESI_EXIT:
+        return False
+    return is_etf(code)
+
+
+def config_override():
+    # optional KEY=VALUE lines, whitelisted keys only; re-read every handlebar
+    # so ETF_ENTRIES flips take effect intraday without a strategy restart
+    global ETF_ENTRIES
+    try:
+        f = open(CONFIG_FILE, 'r', encoding='utf-8')
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith('#') or '=' not in ln:
+                continue
+            k, v = ln.split('=', 1)
+            k, v = k.strip().upper(), v.strip()
+            if k == 'ETF_ENTRIES':
+                new = v not in ('0', 'false', 'False', 'no')
+                if new != ETF_ENTRIES:
+                    print('[CONFIG] ETF_ENTRIES %s -> %s' % (ETF_ENTRIES, new))
+                    ETF_ENTRIES = new
+        f.close()
+    except Exception:
+        pass
+
+
 def strict_position(ContextInfo, code):
     # position volume only; None when the query itself failed (untrustworthy).
     # Fill verification must never act on a failed query (get_position swallows
@@ -219,14 +289,20 @@ def strict_position(ContextInfo, code):
 
 
 def verify_fills(ContextInfo):
-    # one bar after submit: unfilled -> retry once -> drop phantom + WeCom alert.
-    # passorder returning 0 only means the client parsed the params; a dead
-    # trade session drops the order silently (2026-09-22 incident).
+    # handlebar is tick-driven live (~3s L1 snapshots), NOT per bar: the first
+    # check would run ~3s after submit, long before the fill reaches the
+    # position query (2026-09-28: retry fired 2.9s after submit, fill push
+    # arrived 0.1s later -> double fill; another name triple-filled). Wait
+    # VERIFY_WAIT_SEC before the first check, then: unfilled -> retry the
+    # missing remainder once -> drop phantom + WeCom alert.
     for code in list(VERIFY.keys()):
-        side, base, vol, tries, tag = VERIFY[code]
+        rec = VERIFY[code]
+        side, base, vol, tries, tag = rec[:5]
+        if time.time() - rec[5] < VERIFY_WAIT_SEC:
+            continue
         pos = strict_position(ContextInfo, code)
         if pos is None:
-            continue                       # unknown, check again next bar
+            continue                       # unknown, check again next tick
         done = pos >= base + vol if side == 'BUY' else pos <= base - vol
         if done:
             print('[VERIFY] %s %s x%d filled (pos %d->%d)'
@@ -234,10 +310,13 @@ def verify_fills(ContextInfo):
             del VERIFY[code]
             continue
         if tries == 0:
-            VERIFY[code][3] = 1
-            print('[VERIFY] %s %s x%d NOT filled (pos %d, base %d), retry once'
-                  % (code, side, vol, pos, base))
-            do_order(ContextInfo, code, 23 if side == 'BUY' else 24, vol)
+            rec[3] = 1
+            rec[5] = time.time()           # re-arm the wait for the retry
+            filled = (pos - base) if side == 'BUY' else (base - pos)
+            miss = vol - max(0, filled)    # retry only the missing remainder
+            print('[VERIFY] %s %s x%d NOT filled (pos %d, base %d), retry x%d'
+                  % (code, side, vol, pos, base, miss))
+            do_order(ContextInfo, code, 23 if side == 'BUY' else 24, miss)
             continue
         del VERIFY[code]
         if side == 'BUY' and pos <= base and code in SIM_POS:
@@ -327,7 +406,20 @@ def exdef_load():
             ln = ln.strip()
             if ln and not ln.startswith('#'):
                 parts = ln.split(',')
-                out[parts[0].strip()] = parts[1].strip() if len(parts) > 1 else 'DEFER'
+                code = parts[0].strip()
+                reason = parts[1].strip() if len(parts) > 1 else 'DEFER'
+                rev = parts[2].strip() if len(parts) > 2 else ''
+                if rev != REV:
+                    # latch written by another ruleset: drop it. handlebar
+                    # re-evaluates exits every bar - if the exit still
+                    # qualifies under the CURRENT rules it re-latches on the
+                    # spot, so dropping costs nothing (2026-09-30: a thin-cross
+                    # latch from REV 09-28a auction-executed after the 09-29b
+                    # deploy)
+                    print('[EXDEF] %s latch from rev=%s dropped (current %s)'
+                          % (code, rev or '?', REV))
+                    continue
+                out[code] = reason
         f.close()
     except Exception:
         pass
@@ -338,7 +430,7 @@ def exdef_save():
     try:
         f = open(EXDEF_FILE, 'w', encoding='utf-8')
         for code, reason in EXDEF.items():
-            f.write('%s,%s\n' % (code, reason))
+            f.write('%s,%s,%s\n' % (code, reason, REV))
         f.close()
     except Exception as e:
         print('[WARN] exdef save failed: %s' % e)
@@ -403,6 +495,19 @@ def bar_dt(ContextInfo):
         return time.strftime('%Y-%m-%d %H:%M')
 
 
+def slot1h(ContextInfo):
+    # stable identity of the 1h bar currently forming (A=09:30-10:30,
+    # B=10:30-11:30, C=13:00-14:00, D=14:00-15:00), used as the dedup key
+    # component. Derived from the bar clock, so it is identical for every tick
+    # inside the same 1h bar - unlike live fisher values, which drift per tick.
+    dt = bar_dt(ContextInfo)
+    hm = dt[11:16]
+    slot = ('A' if hm <= '10:30' else
+            'B' if hm <= '11:30' else
+            'C' if hm <= '14:00' else 'D')
+    return '%s %s' % (dt[:10], slot)
+
+
 def eff_position(ContextInfo, code):
     # returns (volume, cost, sellable, is_sim); real account position wins over
     # sim ledger. sellable respects T+1: sim rows bought on the current bar's
@@ -445,9 +550,10 @@ def init(ContextInfo):
     EXDEF.update(exdef_load())
     SIM_POS = simpos_load()
     ContextInfo.set_universe(CODES)
-    print('=== qmt_executor_v2 rev=%s start, account=%s codes=%d vol=%d gate=%s exit_a=%s esi_exit=%s exit_confirm=%s t0=%d backtest=%s pending=%s sim_pos=%s ==='
+    print('=== qmt_executor_v2 rev=%s start, account=%s codes=%d vol=%d gate=%s exit_a=%s esi_exit=%s sell_gate=%s etf_entries=%s t0=%d backtest=%s pending=%s sim_pos=%s ==='
           % (REV, acc_id(ContextInfo), len(CODES), VOLUME, USE_ENTRY_GATE, USE_EXIT_A,
-             USE_ESI_EXIT, USE_EXIT_CONFIRM and '/'.join(EXIT_CONFIRM_TFS) or 'off',
+             (USE_ESI_EXIT and 'stock-off/etf-on' or 'off'), '/'.join(EXIT_CONFIRM_TFS),
+             ETF_ENTRIES,
              len(T0_SET), getattr(ContextInfo, 'do_back_test', False),
              list(PENDING.keys()), SIM_POS))
 
@@ -460,12 +566,17 @@ def handlebar(ContextInfo):
             and hasattr(ContextInfo, 'is_last_bar')
             and not ContextInfo.is_last_bar()):
         return
+    config_override()
     if not getattr(ContextInfo, 'do_back_test', False):
         # pre-open auction ticks (09:15-09:29) pollute the forming bar and
         # produce phantom signals; orders then also land in a non-trading
         # window and are dropped. Skip everything until the 09:30 open.
+        # The first minutes after the open are guarded too: the forming 1h bar
+        # is degenerate (single tick) and the position cache is still syncing.
         _now = time.localtime()
         if (_now.tm_hour, _now.tm_min) < (9, 30):
+            return
+        if time.strftime('%H:%M') < OPEN_GUARD_UNTIL:
             return
     bar_key = '%s %s' % (bar_dt(ContextInfo), ContextInfo.barpos)
     hb = int(time.time() // 300)
@@ -491,9 +602,20 @@ def handlebar(ContextInfo):
         pos, cost, sellable, is_sim = eff_position(ContextInfo, code)
         cross_up = len(f) >= 3 and f[-1] > f[-2] and f[-2] <= f[-3]
         cross_down = len(f) >= 3 and f[-1] < f[-2] and f[-2] >= f[-3]
-        # dedup key = 1h fisher state (identifies the 1h bar; barpos changes every
-        # 5m tick when strategy runs on 5m period, so it cannot be the key)
-        key1h = '%.4f|%.4f|%.4f' % (f[-1], f[-2], f[-3])
+        if cross_down and t60 - f60 < MIN_CROSS:
+            # magnitude floor, mirrored from the entry side: hairline
+            # down-crosses whipsaw deep-negative names at every small gap
+            # (2026-09-29 open dump); ignore them entirely (also blocks the
+            # T+1 EXDEF latch below)
+            cross_down = False
+            print('[SKIP] %s %s down-cross too thin %.3f < %.2f (hairline), ignored'
+                  % (bar_key, code, t60 - f60, MIN_CROSS))
+        # dedup key = identity of the 1h bar currently forming. Do NOT use the
+        # fisher values themselves: live handlebar is tick-driven (~3s L1
+        # snapshots) and the forming bar's fisher drifts every tick, so a
+        # value-keyed LAST_ACT never matches and the same signal can re-fire
+        # (2026-09-28: third order after VERIFY drop, 002185 triple-filled)
+        key1h = slot1h(ContextInfo)
 
         pkey = '%.3f|%.3f|%d' % (f60, t60, pos)
         if LAST_PRINT.get(code) != pkey:
@@ -511,6 +633,8 @@ def handlebar(ContextInfo):
                 # position gone (sold/manually closed) - drop stale deferred exit
                 EXDEF.pop(code, None)
                 exdef_save()
+            if is_etf(code) and not ETF_ENTRIES:
+                continue            # ETF entry switch off: exits still managed
             if bar_dt(ContextInfo)[11:16] >= ENTRY_TO:
                 # late-day entries blocked (see ENTRY_TO comment); throttle log
                 lk = (code, 'LATE')
@@ -519,10 +643,14 @@ def handlebar(ContextInfo):
                     print('[SKIP] %s %s entry window closed (after %s)'
                           % (bar_key, code, ENTRY_TO))
                 continue
-            if cross_up and f60 - t60 < MIN_CROSS:
+            if cross_up and f60 - t60 < MIN_CROSS_ENTRY:
                 cross_up = False
                 print('[SKIP] %s %s cross too thin %.3f < %.2f (hairline), ignored'
-                      % (bar_key, code, f60 - t60, MIN_CROSS))
+                      % (bar_key, code, f60 - t60, MIN_CROSS_ENTRY))
+            if cross_up and f60 >= MAX_F60:
+                cross_up = False
+                print('[SKIP] %s %s high-position entry fish60=%.3f >= %.2f, ignored'
+                      % (bar_key, code, f60, MAX_F60))
             if cross_up and LAST_ACT.get((code, 'BUY')) != key1h:
                 if USE_ENTRY_GATE:
                     downs = []
@@ -543,7 +671,7 @@ def handlebar(ContextInfo):
                         continue
                 vol = VOL_MAP.get(code, VOLUME)
                 do_order(ContextInfo, code, 23, vol)
-                VERIFY[code] = ['BUY', pos, vol, 0, 'BUY']
+                VERIFY[code] = ['BUY', pos, vol, 0, 'BUY', time.time()]
                 LAST_ACT[(code, 'BUY')] = key1h
                 pending_remove(code)
                 simpos_on_buy(ContextInfo, code, vol, get_last_price(ContextInfo, code))
@@ -572,7 +700,7 @@ def handlebar(ContextInfo):
                     continue
                 vol = VOL_MAP.get(code, VOLUME)
                 do_order(ContextInfo, code, 23, vol)
-                VERIFY[code] = ['BUY', pos, vol, 0, 'REACTIVATED']
+                VERIFY[code] = ['BUY', pos, vol, 0, 'REACTIVATED', time.time()]
                 LAST_ACT[(code, 'BUY')] = key1h
                 pending_remove(code)
                 simpos_on_buy(ContextInfo, code, vol, get_last_price(ContextInfo, code))
@@ -589,7 +717,7 @@ def handlebar(ContextInfo):
                 reason = None
                 if USE_EXIT_A and cross_down:
                     reason = 'DEFER_EXIT_A'
-                elif USE_ESI_EXIT and cost > 0.0:
+                elif esi_enabled(code) and cost > 0.0:
                     price0 = get_last_price(ContextInfo, code)
                     if price0 > 0.0 and price0 < cost \
                             and esi_cross_down(ContextInfo, code):
@@ -611,19 +739,36 @@ def handlebar(ContextInfo):
                           % (bar_dt(ContextInfo), code, pos))
                 continue
             if code in EXDEF:
-                # deferred exit latched during T+1 freeze: execute now
-                reason = EXDEF.pop(code)
+                # deferred exit latched during T+1 freeze. Re-validate the
+                # rationale against the CURRENT bar before executing: a latch
+                # whose reason evaporated overnight (gap-up recovery) must not
+                # fire (mirrors the PSELL void rule)
+                reason = EXDEF[code]
+                if reason == 'DEFER_EXIT_A':
+                    ok = f60 < t60
+                elif reason == 'DEFER_ESI':
+                    px0 = get_last_price(ContextInfo, code)
+                    ok = not (cost > 0.0 and px0 > 0.0 and px0 >= cost)
+                else:
+                    ok = True
+                if not ok:
+                    EXDEF.pop(code)
+                    exdef_save()
+                    print('[CANCEL] %s %s deferred exit dropped (%s no longer holds)'
+                          % (bar_dt(ContextInfo), code, reason))
+                    continue
+                EXDEF.pop(code)
                 exdef_save()
                 do_order(ContextInfo, code, 24, sellable)
-                VERIFY[code] = ['SELL', pos, sellable, 0, reason]
+                VERIFY[code] = ['SELL', pos, sellable, 0, reason, time.time()]
                 LAST_ACT[(code, 'SELL')] = key1h
                 simpos_on_sell(code)
                 print('>>> SELL %s %s %d shares (%s, T+1 freeze deferred)'
                       % (bar_dt(ContextInfo), code, sellable, reason))
                 continue
-            # deferred Exit A: 1h crossed down while floating profit; sell once
-            # 15m/30m/5m are ALL in down state; void if 1h fish recovers above
-            # its trigger (trend restored)
+            # deferred Exit A: 1h crossed down but the small-tf sell gate was
+            # not fully down (fake-invalid exit); sell once 15m/30m/5m are ALL
+            # in down state; void if 1h fish recovers above its trigger
             if code in PSELL:
                 if f60 > t60:
                     PSELL.pop(code, None)
@@ -644,7 +789,7 @@ def handlebar(ContextInfo):
                         continue
                     if len(downs) == len(EXIT_CONFIRM_TFS):
                         do_order(ContextInfo, code, 24, sellable)
-                        VERIFY[code] = ['SELL', pos, sellable, 0, 'EXIT_A_C']
+                        VERIFY[code] = ['SELL', pos, sellable, 0, 'EXIT_A_C', time.time()]
                         LAST_ACT[(code, 'SELL')] = PSELL.pop(code)
                         simpos_on_sell(code)
                         print('>>> SELL %s %s %d shares (1h cross down + %s confirm)'
@@ -654,22 +799,37 @@ def handlebar(ContextInfo):
             if cross_down and USE_EXIT_A:
                 if LAST_ACT.get((code, 'SELL')) == key1h:
                     continue
-                price = get_last_price(ContextInfo, code)
-                if USE_EXIT_CONFIRM and cost > 0.0 and price >= cost:
+                # sell gate mirrors the entry gate: the 1h down-cross is acted
+                # on only when 15m/30m/5m are ALL in down state; any still up
+                # = fake-invalid exit -> defer + watch (PSELL)
+                downs = []
+                unknown = False
+                for tf in EXIT_CONFIRM_TFS:
+                    st = tf_state(ContextInfo, code, tf)
+                    if st is None:
+                        unknown = True
+                        break
+                    if st[2]:
+                        downs.append(tf)
+                if unknown:
+                    print('[WARN] %s %s sell gate state unknown, skip bar'
+                          % (bar_dt(ContextInfo), code))
+                    continue
+                if len(downs) < len(EXIT_CONFIRM_TFS):
                     PSELL[code] = key1h
-                    print('[DEFER] %s %s 1h cross down but floating profit '
-                          '%.3f >= cost %.3f, wait %s confirm'
-                          % (bar_dt(ContextInfo), code, price, cost,
-                             '/'.join(EXIT_CONFIRM_TFS)))
+                    print('[DEFER] %s %s 1h cross down but %s not all down '
+                          '(fake-invalid exit, watching)'
+                          % (bar_dt(ContextInfo), code, '/'.join(EXIT_CONFIRM_TFS)))
                     continue
                 do_order(ContextInfo, code, 24, sellable)
-                VERIFY[code] = ['SELL', pos, sellable, 0, 'EXIT_A']
+                VERIFY[code] = ['SELL', pos, sellable, 0, 'EXIT_A', time.time()]
                 LAST_ACT[(code, 'SELL')] = key1h
                 simpos_on_sell(code)
-                print('>>> SELL %s %s %d shares (1h cross down), fish60=%.3f'
-                      % (bar_dt(ContextInfo), code, sellable, f60))
+                print('>>> SELL %s %s %d shares (1h cross down + %s all down), fish60=%.3f'
+                      % (bar_dt(ContextInfo), code, sellable,
+                         '/'.join(EXIT_CONFIRM_TFS), f60))
                 continue
-            if USE_ESI_EXIT:
+            if esi_enabled(code):
                 st30 = tf_state(ContextInfo, code, '30m')
                 if st30 is None:
                     continue
@@ -693,7 +853,7 @@ def handlebar(ContextInfo):
                     if LAST_ACT.get((code, 'ESI')) == key30:
                         continue
                     do_order(ContextInfo, code, 24, sellable)
-                    VERIFY[code] = ['SELL', pos, sellable, 0, 'ESI']
+                    VERIFY[code] = ['SELL', pos, sellable, 0, 'ESI', time.time()]
                     LAST_ACT[(code, 'ESI')] = key30
                     simpos_on_sell(code)
                     print('>>> ESI-SELL %s %s %d shares (30m down, price %.2f < cost %.2f)'

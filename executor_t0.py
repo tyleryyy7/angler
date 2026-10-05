@@ -70,9 +70,13 @@ STALE_EXIT_AT = '09:35'          # sim positions carried from yesterday -> exit
 MAX_TRADES_PER_CODE = 10         # entry count limit per code per day
 MAX_DAILY_LOSS = -300.0          # account-level realized pnl floor; then flat-only
 FEE_MIN_NOTIONAL = 50000.0       # below this the 5-yuan commission floor dominates
+VERIFY_WAIT_SEC = 90             # min seconds between order submit and first fill
+                                 # check: handlebar is tick-driven live (~3s), but
+                                 # the position query lags the fill push by seconds;
+                                 # checking earlier double-filled 513750 (2026-09-28)
 
 USE_HARD_STOP = True
-REV = '2026-09-23c'              # bumped on every repo edit; printed in the start
+REV = '2026-09-28a'              # bumped on every repo edit; printed in the start
                                  # banner so the deployed copy's version is always
                                  # identifiable from the client log (a stale paste
                                  # once ran silently for a whole day)
@@ -114,8 +118,9 @@ DAY_STATE = {}                   # (code, yyyymmdd) -> bool, daily filter cache
 MD2_WARNED = set()               # market_data2 empty-result warnings already printed
 PSELL = {}                       # code -> key_mid of deferred Exit A (floating profit,
                                  # waiting 1m down confirm; in-memory, lost on restart)
-VERIFY = {}                      # code -> [side, base_pos, vol, tries, tag]: post-order
-                                 # fill check next bar; retry once, then WeCom alert
+VERIFY = {}                      # code -> [side, base_pos, vol, tries, tag, submit_ts]:
+                                 # fill check VERIFY_WAIT_SEC after submit; retry the
+                                 # missing remainder once, then WeCom alert
 WEBHOOK_KEY_FILE = r'D:\angler\webhook.key'
 STOPPCT = {}                     # code -> (ctx_bar_key, pct): ATR stop cache
 SIM_POS_PATH = SIM_POS_FILE
@@ -315,14 +320,20 @@ def strict_position(ContextInfo, code):
 
 
 def verify_fills(ContextInfo):
-    # one bar after submit: unfilled -> retry once -> drop phantom + WeCom alert.
-    # passorder returning 0 only means the client parsed the params; a dead
-    # trade session drops the order silently (2026-09-22 incident).
+    # handlebar is tick-driven live (~3s L1 snapshots), NOT per bar: the first
+    # check would run ~3s after submit, long before the fill reaches the
+    # position query (2026-09-28: 513750 retry fired 2.9s after submit and
+    # double-filled 6600->13200). Wait VERIFY_WAIT_SEC before the first check,
+    # then: unfilled -> retry the missing remainder once -> drop phantom +
+    # WeCom alert.
     for code in list(VERIFY.keys()):
-        side, base, vol, tries, tag = VERIFY[code]
+        rec = VERIFY[code]
+        side, base, vol, tries, tag = rec[:5]
+        if time.time() - rec[5] < VERIFY_WAIT_SEC:
+            continue
         pos = strict_position(ContextInfo, code)
         if pos is None:
-            continue                       # unknown, check again next bar
+            continue                       # unknown, check again next tick
         done = pos >= base + vol if side == 'BUY' else pos <= base - vol
         if done:
             print('[VERIFY] %s %s x%d filled (pos %d->%d)'
@@ -330,10 +341,13 @@ def verify_fills(ContextInfo):
             del VERIFY[code]
             continue
         if tries == 0:
-            VERIFY[code][3] = 1
-            print('[VERIFY] %s %s x%d NOT filled (pos %d, base %d), retry once'
-                  % (code, side, vol, pos, base))
-            do_order(ContextInfo, code, 23 if side == 'BUY' else 24, vol)
+            rec[3] = 1
+            rec[5] = time.time()           # re-arm the wait for the retry
+            filled = (pos - base) if side == 'BUY' else (base - pos)
+            miss = vol - max(0, filled)    # retry only the missing remainder
+            print('[VERIFY] %s %s x%d NOT filled (pos %d, base %d), retry x%d'
+                  % (code, side, vol, pos, base, miss))
+            do_order(ContextInfo, code, 23 if side == 'BUY' else 24, miss)
             continue
         del VERIFY[code]
         if side == 'BUY' and pos <= base and code in SIM_POS:
@@ -684,7 +698,7 @@ def on_sell(ContextInfo, code, pos, sellable, cost, reason, key, is_sim):
     global DAY_PNL, DAY_STOPPED
     price = get_last_price(ContextInfo, code)
     do_order(ContextInfo, code, 24, sellable)
-    VERIFY[code] = ['SELL', pos, sellable, 0, reason]
+    VERIFY[code] = ['SELL', pos, sellable, 0, reason, time.time()]
     LAST_ACT[(code, reason)] = key
     simpos_on_sell(code)
     if price > 0.0 and cost > 0.0:
@@ -956,7 +970,7 @@ def buy(ContextInfo, code, f_ctx, key_ctx, tag):
         print('[WARN] %s notional %.0f < %.0f: 5-yuan commission floor eats the '
               'edge, check volume' % (code, price * vol, FEE_MIN_NOTIONAL))
     do_order(ContextInfo, code, 23, vol)
-    VERIFY[code] = ['BUY', 0, vol, 0, tag]
+    VERIFY[code] = ['BUY', 0, vol, 0, tag, time.time()]
     LAST_ACT[(code, 'BUY')] = key_ctx
     pending_remove(code)
     TRADES_TODAY[code] = TRADES_TODAY.get(code, 0) + 1

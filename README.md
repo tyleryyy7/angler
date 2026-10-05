@@ -40,9 +40,8 @@ fisher_60min_scanner/
 ├── scan_mid.cmd         # bar 中段扫描入口（--live，盘中信号）
 ├── scan_holdings.cmd    # 持仓每 5 分钟监控入口（--holdings --live）
 ├── scan_daily.cmd       # 深水池日共振收盘复核入口（--daily-confirm，15:10）
-├── scan_candidates.cmd  # 盘后候选清单手动入口（--post-close；已并入 build_pool.cmd 自动跑）
 ├── scan_hssr.cmd        # HSSR 周报入口（--hssr-report，每周日 20:00）
-├── build_pool.cmd       # 17:00 一条龙入口（互斥锁 + 盘后自动下载 + tdxq 建五池 + HSSR 注解 + 盘后候选）
+├── build_pool.cmd       # 16:00 一条龙入口（互斥锁 + 盘后自动下载 + tdxq 建五池 + HSSR 注解 + 盘后候选）
 ├── run_hidden.vbs       # 隐藏控制台启动器（计划任务经它调用 .cmd，不弹窗）
 ├── holdings.csv         # 持仓清单（--buy 登记，下穿监控对象）
 ├── AGENTS.md            # AI 助手交接文档
@@ -233,13 +232,14 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 
 | 任务名 | 触发 | 动作 |
 |---|---|---|
-| `fisher_建池` | 工作日 17:00 | `build_pool.cmd` 一条龙：盘后自动下载（refresh_kline 全池）→ tdxq 重建五池 + HSSR 注解 + **--post-close 候选清单推送**，需通达信客户端登录在线 |
-| `fisher_持仓` | 每天 9:31–15:20 每 5 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
-| `fisher_扫描1001` / `1101` / `1331` / `1431` | 工作日对应时刻 | `scan_mid.cmd`：深水+观察+持仓，**盘中信号**（未完结 bar） |
-| `fisher_扫描1031` / `1131` / `1401` / `1501` | 工作日对应时刻 | `scan_all.cmd`：深水+观察+持仓，**完结确认**（bar 收盘后） |
+| `fisher_建池` | 工作日 16:00 | `build_pool.cmd` 一条龙：盘后自动下载（refresh_kline 全池）→ tdxq 重建五池 + HSSR 注解 + **--post-close 候选清单推送**，需通达信客户端登录在线 |
+| `fisher_持仓`（已禁用） | 每天 9:31–15:20 每 5 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
+| `fisher_扫描1001` / `1101` / `1331` / `1431`（已禁用） | 工作日对应时刻 | `scan_mid.cmd`：深水+观察+持仓，**盘中信号**（未完结 bar） |
+| `fisher_扫描1031` / `1131` / `1401` / `1501`（已禁用） | 工作日对应时刻 | `scan_all.cmd`：深水+观察+持仓，**完结确认**（bar 收盘后） |
 | `fisher_日共振` | 工作日 15:10 | `scan_daily.cmd`：深水池日共振收盘复核（60m 日内上穿 + 当日日 K 上穿） |
 | `fisher_HSSR周报` | 每周日 20:00 | `scan_hssr.cmd`：Fisher-ESI 台账 HSSR 周报推送 |
-| `stockdb_盘后同步` | 工作日 15:50 | `stockdb_sync.cmd`：启动 D:\stockdb\数据更新.exe，同步 free-stockdb 本地库（评估中的新数据通道，详见 AGENTS.md 数据通道段） |
+
+（2026-09-22 起盘中扫描任务因数据源问题全部禁用，恢复用 `Enable-ScheduledTask -TaskName <名>`。）
 
 所有任务经 `run_hidden.vbs` 隐藏启动，不弹控制台窗口；均已开启
 「错过计划启动后尽快补跑」（StartWhenAvailable）。
@@ -247,16 +247,14 @@ Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query 
 注册命令（任务不存在或需重建时执行）：
 
 ```cmd
-schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 00:00
+schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 16:00
 schtasks /create /f /tn "fisher_持仓" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_holdings.cmd" /sc minute /mo 5 /st 09:31 /et 15:20
 schtasks /create /f /tn "fisher_扫描1001" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_mid.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:01
 :: 1101 / 1331 / 1431 三条同上（scan_mid.cmd），仅改 /tn 与 /st
 schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_all.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
 :: 1131 / 1401 / 1501 三条同上（scan_all.cmd），仅改 /tn 与 /st
 schtasks /create /f /tn "fisher_日共振" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_daily.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 15:10
-schtasks /create /f /tn "fisher_盘后下载" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" download_data.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 16:00
 schtasks /create /f /tn "fisher_HSSR周报" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_hssr.cmd" /sc weekly /d SUN /st 20:00
-schtasks /create /f /tn "stockdb_盘后同步" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" stockdb_sync.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 15:50
 ```
 
 补跑开关（新注册任务需执行一次）：
@@ -320,16 +318,16 @@ Get-ScheduledTask -TaskName "任务名" | ForEach-Object { $_.Settings.StartWhen
 ## 大QMT 内置执行器（executor_v2.py）
 
 项目根目录的 `executor_v2.py` 是大QMT 内置策略的 git 主版本；部署副本是
-`D:\国金证券QMT交易端\python\钓鱼.py`（已验证可直接写入，无需经编辑器手动拷贝）。
+`D:\国金证券QMT交易端\python\钓鱼.py`（客户端有文件虚拟化，外部写入客户端不可见，
+只能经客户端编辑器全选粘贴部署）。
 对齐扫描器 ESI v2 规则：进场 = 1h 上穿 + R1 小周期闸门（30m/15m/5m 下行段不买）；
 R2 假性失效观察（被拦票进待激活，三周期回上行且 1h 未破 → 激活买入，1h 破趋势 → 作废）；
 离场 = 1h 下穿全卖（USE_EXIT_A）+ R3 亏损即卖（30m 下穿且现价 < 成本，USE_ESI_EXIT）。
 
 ### 部署
-1. 运行 `sync_qmt.cmd` 一键同步（备份旧版到 QMT python\backups\，覆盖前检查源文件纯 ASCII；
-   中文路径经 sync_qmt.ps1 走 PowerShell，cmd 里直接写中文路径会被 GBK 解析乱码）。
-   同步后需在 QMT 客户端重启策略加载新版本。
-   首次部署才需把内容拷入策略编辑器（源文件 UTF-8、纯 ASCII、py3.6、无 pandas）。
+1. 在 QMT 客户端策略编辑器里**全选粘贴**仓库 `executor_v2.py` 内容（sync_qmt 一键同步已失效删除：
+   客户端对 python\ 目录有文件虚拟化，外部写入客户端不可见）。源文件 UTF-8、纯 ASCII、
+   py3.6、无 pandas。粘贴后在客户端重启策略加载新版本，启动横幅核对 REV。
 2. 账号优先用 QMT 客户端运行界面绑定的账号（ContextInfo.accountid），配置区 `ACCOUNT_ID`
    仅作兜底；另改 `VOLUME`（默认每单股数）、三个开关。
    数据周期参数 `'1h'`——国金构建不认 `'60m'`；回测/运行界面周期建议选 5 分钟（R3 响应快）。

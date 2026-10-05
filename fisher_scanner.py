@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 
 # ----------------------- 配置区（按需修改） -----------------------
-DATA_SOURCE = "tdxq"      # 数据源："tdxq"（默认，通达信客户端 TQ，须客户端登录）/ "sina" / "em"（本机被封）
+DATA_SOURCE = "tdxq"      # 数据源："tdxq"（默认，通达信客户端 TQ，须客户端登录）/ "sina"（手动备用）
 FISHER_LEN = 9            # Fisher 窗口长度，与 Pine/同花顺参数一致
 MIN_BARS = 80             # 60分钟bar少于此数视为暖机不足，跳过（次新股、长期停牌）
 REQUEST_INTERVAL = 0.8    # sina 请求间隔基准（秒），加 ±0.2s 抖动防规律性指纹（2026-09-15 起温柔模式）
@@ -378,8 +378,9 @@ def _fetch_30m_tdxq(code):
 def fetch_60m(code, source=None, count=None):
     """拉取单只股票的 60 分钟前复权 K 线，带重试。失败返回 None。
 
-    source: "tdxq"（默认，通达信客户端 TQ，须客户端登录，整池预取+本地缓存）/ "sina" / "em"（东财）。
-    count: 仅 tdxq 源生效（单次上限 800），None 时用各源默认深度。
+    source: "tdxq"（默认，通达信客户端 TQ，须客户端登录，整池预取+本地缓存）/ "sina"。
+    count: 仅 tdxq 源生效（实测无 800 上限，2026-09-29 验证 count=20000 可取），
+    None 时用各源默认深度。
     """
     source = source or DATA_SOURCE
     for k in range(RETRY):
@@ -1660,7 +1661,7 @@ def main():
     parser.add_argument("--limit", type=int, help="只扫描前 N 只（调试）")
     parser.add_argument("--side", choices=["up", "down"], default="up",
                         help="up=上穿（默认，选股），down=下穿（持仓监控）")
-    parser.add_argument("--source", choices=["sina", "em", "tdxq", "auto"], default=None,
+    parser.add_argument("--source", choices=["sina", "tdxq", "auto"], default=None,
                         help="数据源（缺省用配置区 DATA_SOURCE）；"
                              "auto 仅用于 --annotate-hssr（等价 sina，历史兼容）")
     parser.add_argument("--buy", metavar="CODE", help="登记买入到 holdings.csv 后退出")

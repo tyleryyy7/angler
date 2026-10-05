@@ -262,15 +262,21 @@ def _day_filter_pass(code6):
     return d_f > d_prev if DAY_FILTER_MODE == "up" else d_f >= d_t
 
 
-def post_close_candidates():
+def post_close_candidates(target_date=None):
     """盘后候选：全五池完结扫描，合并写 candidates CSV + 推送汇总（人工挑票入 watchlist）。
-    凌晨跑（建池后）：目标交易日 = 上一交易日。"""
-    now = datetime.now()
-    day = now
-    if now.strftime("%H:%M") < "09:35":
-        day = now - timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
+    凌晨跑（建池后）：目标交易日 = 上一交易日。
+    target_date（YYYY-MM-DD）：补算指定交易日，要求 tdxq 数据恰停在当日收盘
+    （扫描判最新完结 bar，数据若含更晚交易日则结果不是目标日的）。"""
+    if target_date:
+        day = datetime.strptime(target_date, "%Y-%m-%d")
+        now = day.replace(hour=16)   # 让新鲜度/收盘门禁把目标日视作"当日盘后"
+    else:
+        now = datetime.now()
+        day = now
+        if now.strftime("%H:%M") < "09:35":
+            day = now - timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
     day_str = day.strftime("%Y-%m-%d")
     pools5 = [("pool_right.csv", "右侧"), ("pool_left.csv", "左侧"),
               ("pool_deep.csv", "深水"), ("pool_t0.csv", "T0"),
@@ -279,8 +285,8 @@ def post_close_candidates():
     # 判定前先用探针票刷新缓存：缓存可能是注解/旧扫描在静态库无数据时写入的
     # 昨日数据，直接判会误判 tdxq 不可用（2026-09-16 实发）。
     # 2026-09-17 起 sina 停用：缺数据时直接中止，避免拿昨日 bar 当今日信号推送。
-    fs._prefetch_tdxq(["600036", "000001", "510300"], period="1h", count=5)
-    if not fs.tdxq_has_today_close():
+    fs._prefetch_tdxq(["600036", "000001", "510300"], period="1h", count=50)
+    if not fs.tdxq_has_today_close(now):
         logging.warning("tdxq 缺当日收盘数据（盘后未下载？），候选扫描中止")
         push_alert("**盘后候选扫描中止：tdxq 无当日收盘数据（盘后下载未完成？）**")
         return
@@ -307,7 +313,9 @@ def post_close_candidates():
     # 日K 上穿名单（独立于 60m 名单）：六池并集。
     # 注意：cache/tdxq 的 1d 缓存是建池时写的（停在昨日），直接判会错位一天
     #（2026-09-15 风语筑误报实测）。先批量预取最新日线再判。
-    fs._prefetch_tdxq(list(pool_rows.keys()), period="1d", count=30)
+    # 注意：cache 的 1d 缓存会被本预取覆盖写；count 取 100（原 30）给日线费雪
+    # 留够暖机，也避免把回测依赖的历史深度冲掉。
+    fs._prefetch_tdxq(list(pool_rows.keys()), period="1d", count=100)
     # 60m 候选日K过滤（executor_t0 同款：日线费雪回升才保留；日K上穿名单
     # 按定义必然满足，无需过滤）。须在 1d 预取之后判，否则用建池旧缓存。
     dropped = []
@@ -407,6 +415,8 @@ def main():
                         help="推送 Fisher-ESI 台账 HSSR 周报（每周日任务，须在周末保护之前）")
     parser.add_argument("--post-close", action="store_true",
                         help="盘后候选：全五池完结扫描 + 候选清单推送（21:30 任务）")
+    parser.add_argument("--date", metavar="YYYY-MM-DD",
+                        help="配合 --post-close 补算指定交易日（数据须停在当日收盘）")
     args = parser.parse_args()
 
     if args.hssr_report:
@@ -414,7 +424,7 @@ def main():
         return
 
     if args.post_close:
-        post_close_candidates()
+        post_close_candidates(args.date)
         return
 
     if datetime.now().weekday() >= 5:

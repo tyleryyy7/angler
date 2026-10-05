@@ -10,17 +10,27 @@ STOP_MODE=fixed 与 STOP_MODE=atr 两种模式并对比；并做进场假设变�
               （15m 上穿作为 1h 上涨趋势中的回调买点）；
   V2 深极值  = 进场时 15m fisher < -1.5（恐慌深位）才许买；
   V3 组合   = V1 AND V2。
+  V4 日线趋势 / V5 日线∧深极值；V6/V7 = 关 14:55 强平（实验 E）；
+  V8 REGIME-Conditional：日线 MA20 状态机路由 TREND(浅位跟随+60m确认) /
+  FALL(V2 深值)。V9 = 纯 TREND；V10 = 降频 30m 阶梯；
+  V11 = 1m 驱动双闸门保真（可测 TF_ESI=1m）；V12 = 1m 原生快阶梯
+  （1m 数据回填后可跑，见实验 O）。
 完整输出（fixed/atr 对比 + 进场变体对比）Tee 到
 results/backtest_t0_variants_report.txt（2026-09-23 起，新文件；
 旧的 STOP_MODE 对比报告留在 results/backtest_t0_replay_report.txt）。
 尾部另有「实验 B：ESI 出场反事实尸检」段：对 V0(atr) 的 ESI 出场单做
 三种持有假设反事实（硬扛到 FLAT / 慢一个 cross down 出 / 扛到回本或
 FLAT）+ ESI 延迟激活实验（N=0/3/6/12 根 5m bar）。
+追加实验段：H 名义本金/费用地板扫描（V0/V2 × 1/2/5/10 万）、
+I ENTRY_DEEP_MIN 门槛扫描（-1.0/-1.5/-2.0/-2.5）、J V8 判定（通过标准
+见 AGENTS.md 未来方向）、K 开关消融（V2 基座去闸门/去 ESI/去硬止损）、
+L 毛利分层尸检、M V9 纯 TREND+分样本子集验证、N V10 降频 30m 阶梯、
+O 1m 级别（V11 1m 驱动双闸门保真 + TF_ESI=1m 实测 / V12 1m 原生）。
 
 口径近似（与实盘的差异，解读结果时务必考虑）：
 1. 实盘跑 1m bar，进场闸门 = 5m 与 1m 双周期「不在下行段」；回放无 1m
    数据，用 5m 单周期近似（信号时刻已完结 5m 序列的 fish[-1] >= fish[-2]
-   即放行），与 backtest_entry_filter.py 的 15m 研究口径一致。
+   即放行），与早期 15m 研究口径一致（backtest_entry_filter.py，已删，git 历史可查）。
 2. Exit A 实盘对浮盈单有延迟确认（USE_EXIT_CONFIRM：等 1m 进入下行段，
    5m 回到 trigger 上方则作废）；回放直接卖出（close < cost 记 ESI，
    >= cost 记 EXIT_A），会略高估 EXIT_A 的及时性。
@@ -258,29 +268,135 @@ def hour_win_close(minutes):
     return 900
 
 
+def win_close_5(minutes):
+    # 1m bar 收盘时刻（当日分钟数）-> 所属 5m 窗口的收盘时刻（分钟数）。
+    # 5m bar 边界 …10:55/11:00/…/13:05/…/15:00，午休 11:30~13:00 不跨窗口。
+    if minutes % 5 == 0:
+        q = minutes
+    else:
+        q = (minutes // 5 + 1) * 5
+    if 690 < q < 785:
+        q = 785
+    if q > 900:
+        q = 900
+    return q
+
+
+def forming_last(ht, hl2, f_pre, v_pre, bars, i, day, m, winc):
+    """「完结 + 形成中」序列在 winc 窗口下的 fisher 末值/前一根/前两根。
+    与 replay 内 15m 快速路径同算法（bisect 定位完结根数 + 形成 bar 增量
+    重算）。bars 为当日驱动 bar 列表 [(g, b), ...]，i 为当前下标，m 为当前
+    bar 收盘分钟数。返回 (q, f_last, f_m1, f_m2)。"""
+    q = winc(m)
+    qt = '%s %02d:%02d:00' % (day, q // 60, q % 60)
+    k = bisect_left(ht, qt)
+    fh = fl = None
+    fc = 0.0
+    for j in range(i, -1, -1):
+        bj = bars[j][1]
+        mj = int(bj['time'][11:13]) * 60 + int(bj['time'][14:16])
+        if winc(mj) != q:
+            break
+        fh = bj['h'] if fh is None else max(fh, bj['h'])
+        fl = bj['l'] if fl is None else min(fl, bj['l'])
+        fc = bj['c']
+    fh2 = (fh + fl) / 2.0
+    s = k - (LENGTH - 1)
+    if s < 0:
+        s = 0
+    win = hl2[s:k] + [fh2]
+    hh = max(win)
+    ll = min(win)
+    div = (hh - ll) if hh != ll else 1.0
+    pv = v_pre[k - 1] if k >= 1 else 0.0
+    pf = f_pre[k - 1] if k >= 1 else 0.0
+    vx = 0.66 * ((fh2 - ll) / div - 0.5) + 0.67 * pv
+    if vx > 0.99:
+        vx = 0.999
+    elif vx < -0.99:
+        vx = -0.999
+    f_last = 0.5 * math.log((1.0 + vx) / (1.0 - vx)) + 0.5 * pf
+    f_m1 = f_pre[k - 1] if k >= 1 else None
+    f_m2 = f_pre[k - 2] if k >= 2 else None
+    return q, f_last, f_m1, f_m2
+
+
+def win_close_30(minutes):
+    # 5m bar 收盘时刻（当日分钟数）-> 所属 30m 窗口的收盘时刻（分钟数）。
+    # A 股 30m bar 边界：10:00/10:30/11:00/11:30/13:30/14:00/14:30/15:00，
+    # 午休 11:30~13:00 不跨窗口。
+    if minutes <= 600:
+        return 600
+    if minutes <= 630:
+        return 630
+    if minutes <= 660:
+        return 660
+    if minutes <= 690:
+        return 690
+    if minutes <= 810:
+        return 810
+    if minutes <= 840:
+        return 840
+    if minutes <= 870:
+        return 870
+    return 900
+
+
 def comm(price, vol):
     return max(5.0, price * vol * 0.00025)
 
 
-def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
+def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False,
+           nominal=FIXED_NOTIONAL, v2_threshold=V2_THRESHOLD,
+           use_gate=True, use_esi=True, use_stop=True, esi_tf='5m'):
     # esi_delay: 进场后前 N 根 5m bar 内 ESI 不激活（该窗口内浮亏 cross
     # down 走 EXIT_A 同价出场，但不触发当日禁入）；N=0 = 现状。
-    # 仓位 = 固定名义本金 FIXED_NOTIONAL/入场价 取整百股（最低 100 股），
-    # 在进场信号 bar 上计算并固定到该笔结束。
+    # nominal: 每笔固定名义本金（元），vol = nominal/入场价 取整百股
+    # （最低 100 股），在进场信号 bar 上计算并固定到该笔结束。
+    # v2_threshold: V2/V3/V5 及 V8-FALL 分支的 15m 深位门槛。
+    # use_gate/use_esi/use_stop: 消融开关（默认全开 = 实盘口径）。
+    # esi_tf: ESI 判定周期（'5m' 默认 / '1m'，仅 V11 有意义）。
+    # V11 = 1m 驱动保真版：1m bar 逐根驱动，15m 上下文（形成中聚合），
+    #      进场闸门 = 5m形成中不在下行 且 1m 不在下行（实盘双闸门真身），
+    #      出场 Exit A = 5m形成中 cross down，ESI = esi_tf 周期 cross down。
+    # V12 = 1m 原生快阶梯：5m形成中 cross_up 进场 + 1m 闸门，
+    #      1m cross down 出场（ESI/EXIT_A 同口径）。
     # V4 = 日线趋势过滤：进场日之前的完结日线 fish[-1] > fish[-2] 才买
     #      （executor_t0.day_ok 口径，形成中的今日 bar 不参与）；
     # V5 = V4 AND V2（日线趋势 ∧ 15m 深极值）。
+    # V8 = REGIME-Conditional：日线 收盘>MA20 且 MA20 连续 2 日上行 →
+    #      TREND（浅位跟随 + 60m fish>trigger 确认，同 V1 机制），否则
+    #      FALL（V2 深值进场）；切换需连续 2 根日线同向（迟滞）。
+    # V9 = 纯 TREND：只保留 V8 的 TREND 分支（FALL 日不进场）。
+    # V10 = 降频：30m cross_up 进场 + 15m 闸门，15m cross down 出
+    #      （ESI/EXIT_A 同口径移到 15m；ATR 仍按 15m 计算）。
     # no_flat（实验 E 的 V6/V7）：删除 14:55 FLAT 分支，仓位可隔夜；
     # 出场只剩 ATR 硬止损 / ESI / EXIT_A，出场后可再进（禁入照旧）；
     # 15m/5m 序列天然跨日连续（历史 bar 全量参与，无隔夜衔接处理）。
-    # pos = [entry_g, entry_i, cost, vol, sp, nights, gaps, flat_ref]
+    # pos = [entry_g, entry_i, cost, vol, sp, nights, gaps, flat_ref, branch]
     b5 = load_bars(code, '5m')
     h15 = load_bars(code, '15m')
-    h1 = load_bars(code, '1h') if variant in ('V1', 'V3') else []
-    d1 = load_bars(code, '1d') if variant in ('V4', 'V5') else []
+    drive = '1m' if variant in ('V11', 'V12') else '5m'
+    try:
+        bd = load_bars(code, '1m') if drive == '1m' else b5
+    except Exception:
+        return []               # 缺驱动周期缓存（如 1m 未回填）
+    if not bd:
+        return []
+    h1 = load_bars(code, '1h') if variant in ('V1', 'V3', 'V8', 'V9') else []
+    d1 = load_bars(code, '1d') if variant in ('V4', 'V5', 'V8', 'V9') else []
+    h30 = load_bars(code, '30m') if variant == 'V10' else []
     f1d = fisher_series([x['h'] for x in d1], [x['l'] for x in d1]) \
         if d1 else []
     f5_all = fisher_series([b['h'] for b in b5], [b['l'] for b in b5])
+    if drive == '1m':
+        # 1m 驱动：5m 完结前缀（闸门/Exit A 的形成中计算用）+ 1m 全量 fisher
+        h5_h = [x['h'] for x in b5]
+        h5_l = [x['l'] for x in b5]
+        h5_t = [x['time'] for x in b5]
+        hl2_5 = [(h5_h[j] + h5_l[j]) / 2.0 for j in range(len(b5))]
+        f5_pre, v5_pre = fisher_series_v(h5_h, h5_l)
+        f1_all = fisher_series([b['h'] for b in bd], [b['l'] for b in bd])
     # 15m/1h 完结 bar 的 fisher 前缀（每 replay 调用一次；形成 bar 的末
     # 元素逐 bar 增量重算，与全量 fisher_series 逐位一致——厚样本下全量
     # 每 bar 重算 O(N*9) 不可接受）
@@ -290,16 +406,42 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
     h15_t = [x['time'] for x in h15]
     hl2_15 = [(h15_h[j] + h15_l[j]) / 2.0 for j in range(len(h15))]
     f15_pre, v15_pre = fisher_series_v(h15_h, h15_l)
-    if variant in ('V1', 'V3'):
+    if variant in ('V1', 'V3', 'V8', 'V9'):
         h1_h = [x['h'] for x in h1]
         h1_l = [x['l'] for x in h1]
         h1_t = [x['time'] for x in h1]
         hl2_1h = [(h1_h[j] + h1_l[j]) / 2.0 for j in range(len(h1))]
         f1h_pre, v1h_pre = fisher_series_v(h1_h, h1_l)
-    if variant in ('V4', 'V5'):
+    if variant in ('V4', 'V5', 'V8', 'V9'):
         d1_dates = [x['time'][:10] for x in d1]
+    if variant == 'V10':
+        h30_h = [x['h'] for x in h30]
+        h30_l = [x['l'] for x in h30]
+        h30_t = [x['time'] for x in h30]
+        hl2_30 = [(h30_h[j] + h30_l[j]) / 2.0 for j in range(len(h30))]
+        f30_pre, v30_pre = fisher_series_v(h30_h, h30_l)
+    if variant in ('V8', 'V9'):
+        # regime 状态机：raw = 收盘>MA20 且 MA20 连续 2 日上行；切换需
+        # 连续 2 根 raw 同向（迟滞防抖动）。判定用完结日线（d1_dates < day）。
+        d1_c = [x['c'] for x in d1]
+        n1 = len(d1_c)
+        ma20 = [None] * n1
+        for i in range(19, n1):
+            ma20[i] = sum(d1_c[i - 19:i + 1]) / 20.0
+        raw = [False] * n1
+        for i in range(21, n1):
+            raw[i] = (d1_c[i] > ma20[i] and ma20[i] > ma20[i - 1]
+                      and ma20[i - 1] > ma20[i - 2])
+        regime = ['FALL'] * n1
+        cur = 'FALL'
+        for i in range(1, n1):
+            if raw[i] and raw[i - 1]:
+                cur = 'TREND'
+            elif not raw[i] and not raw[i - 1]:
+                cur = 'FALL'
+            regime[i] = cur
     by_day = defaultdict(list)
-    for g, b in enumerate(b5):
+    for g, b in enumerate(bd):
         by_day[b['time'][:10]].append((g, b))
     trades = []
     pos = None               # 见 docstring；no_flat 时跨日保持
@@ -390,11 +532,41 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                                         STOP_PCT_MAX,
                                         atr / Cs[-1] * STOP_ATR_MULT))
                             atr_cache[qkey] = sp
-                    if price < pos[2] * (1.0 - sp):
+                    if use_stop and price < pos[2] * (1.0 - sp):
                         reason = 'STOP'
+                    elif variant == 'V10':
+                        # V10 降频：出场下穿判定移到 15m 序列
+                        if f15_m2 is not None and f15_last < f15_m1 \
+                                and f15_m1 >= f15_m2:
+                            if use_esi and price < pos[2] \
+                                    and (i - pos[1]) >= esi_delay:
+                                reason = 'ESI'
+                            else:
+                                reason = 'EXIT_A'
+                    elif variant in ('V11', 'V12'):
+                        if variant == 'V12':
+                            cd_a = g >= 2 and f1_all[g] < f1_all[g - 1] \
+                                and f1_all[g - 1] >= f1_all[g - 2]
+                            cd_e = cd_a
+                        else:
+                            _, xl, xm1, xm2 = forming_last(
+                                h5_t, hl2_5, f5_pre, v5_pre, bars, i, day, m,
+                                win_close_5)
+                            cd_a = xm2 is not None and xl < xm1 and xm1 >= xm2
+                            if esi_tf == '1m':
+                                cd_e = g >= 2 and f1_all[g] < f1_all[g - 1] \
+                                    and f1_all[g - 1] >= f1_all[g - 2]
+                            else:
+                                cd_e = cd_a
+                        if cd_a or cd_e:
+                            if use_esi and cd_e and price < pos[2] \
+                                    and (i - pos[1]) >= esi_delay:
+                                reason = 'ESI'
+                            elif cd_a:
+                                reason = 'EXIT_A'
                     elif g >= 2 and f5_all[g] < f5_all[g - 1] \
                             and f5_all[g - 1] >= f5_all[g - 2]:
-                        if price < pos[2] and (i - pos[1]) >= esi_delay:
+                        if use_esi and price < pos[2] and (i - pos[1]) >= esi_delay:
                             reason = 'ESI'
                         else:
                             reason = 'EXIT_A'
@@ -403,7 +575,7 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                     fee = comm(pos[2], pos[3]) + comm(price, pos[3])
                     trades.append({
                         'code': code, 'day': day,
-                        'entry': b5[pos[0]]['time'][11:16], 'exit': hhmm,
+                        'entry': bd[pos[0]]['time'][11:16], 'exit': hhmm,
                         'buy': pos[2], 'sell': price,
                         'gross': gross, 'fee': fee, 'net': gross - fee,
                         'reason': reason, 'bars': g - pos[0],
@@ -411,7 +583,9 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                         'sp': (pos[4] if len(pos) > 4 else None),
                         'nights': pos[5], 'gaps': list(pos[6]),
                         'flat_ref': pos[7],
-                        'eday': b5[pos[0]]['time'][:10]})
+                        'branch': pos[8] if len(pos) > 8 else None,
+                        'f15': pos[9] if len(pos) > 9 else None,
+                        'eday': bd[pos[0]]['time'][:10]})
                     if reason in ('ESI', 'STOP'):
                         failed = True
                     pos = None
@@ -424,13 +598,78 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                 continue
             if hhmm < ENTRY_FROM or hhmm > ENTRY_TO:
                 continue
-            cross_up = f15_m2 is not None and f15_last > f15_m1 \
-                and f15_m1 <= f15_m2
-            if not cross_up or last_buy_key == qkey:
+            if variant == 'V10':
+                # 30m「完结 + 形成中」序列（与 15m 快速路径同构）
+                qe = win_close_30(m)
+                key_e = '%s|%02d:%02d' % (day, qe // 60, qe % 60)
+                qt30 = '%s %02d:%02d:00' % (day, qe // 60, qe % 60)
+                k30 = bisect_left(h30_t, qt30)
+                fh30 = fl30 = None
+                fc30 = 0.0
+                for j in range(i, -1, -1):
+                    bj = bars[j][1]
+                    mj = int(bj['time'][11:13]) * 60 \
+                        + int(bj['time'][14:16])
+                    if win_close_30(mj) != qe:
+                        break
+                    fh30 = bj['h'] if fh30 is None else max(fh30, bj['h'])
+                    fl30 = bj['l'] if fl30 is None else min(fl30, bj['l'])
+                    fc30 = bj['c']
+                fh302 = (fh30 + fl30) / 2.0
+                s30 = k30 - (LENGTH - 1)
+                if s30 < 0:
+                    s30 = 0
+                win30 = hl2_30[s30:k30] + [fh302]
+                hh30 = max(win30)
+                ll30 = min(win30)
+                div30 = (hh30 - ll30) if hh30 != ll30 else 1.0
+                pv30 = v30_pre[k30 - 1] if k30 >= 1 else 0.0
+                pf30 = f30_pre[k30 - 1] if k30 >= 1 else 0.0
+                vx30 = 0.66 * ((fh302 - ll30) / div30 - 0.5) + 0.67 * pv30
+                if vx30 > 0.99:
+                    vx30 = 0.999
+                elif vx30 < -0.99:
+                    vx30 = -0.999
+                f30_last = 0.5 * math.log((1.0 + vx30) / (1.0 - vx30)) \
+                    + 0.5 * pf30
+                f30_m1 = f30_pre[k30 - 1] if k30 >= 1 else None
+                f30_m2 = f30_pre[k30 - 2] if k30 >= 2 else None
+                cross_up = f30_m2 is not None and f30_last > f30_m1 \
+                    and f30_m1 <= f30_m2
+            elif variant == 'V12':
+                q5e, e5l, e5m1, e5m2 = forming_last(
+                    h5_t, hl2_5, f5_pre, v5_pre, bars, i, day, m, win_close_5)
+                cross_up = e5m2 is not None and e5l > e5m1 and e5m1 <= e5m2
+                key_e = '%s|%02d:%02d' % (day, q5e // 60, q5e % 60)
+            else:
+                cross_up = f15_m2 is not None and f15_last > f15_m1 \
+                    and f15_m1 <= f15_m2
+                key_e = qkey
+            if not cross_up or last_buy_key == key_e:
                 continue
-            if g < 1 or f5_all[g] < f5_all[g - 1]:   # 5m 闸门（近似 5m/1m）
-                continue
-            if variant in ('V1', 'V3'):
+            if variant == 'V10':
+                if use_gate and (f15_m1 is None or f15_last < f15_m1):
+                    continue                        # V10 闸门 = 15m 不在下行段
+            elif variant == 'V12':
+                if use_gate and g >= 1 and f1_all[g] < f1_all[g - 1]:
+                    continue                        # V12 闸门 = 1m 不在下行段
+            elif variant == 'V11':
+                if use_gate:
+                    _, g5l, g5m1, _ = forming_last(
+                        h5_t, hl2_5, f5_pre, v5_pre, bars, i, day, m,
+                        win_close_5)
+                    if (g5m1 is not None and g5l < g5m1) \
+                            or (g >= 1 and f1_all[g] < f1_all[g - 1]):
+                        continue                # V11 双闸门：5m 或 1m 任一 下行
+            elif use_gate and (g < 1 or f5_all[g] < f5_all[g - 1]):
+                continue                               # 5m 闸门（近似 5m/1m）
+            v8_trend = False
+            if variant in ('V8', 'V9'):
+                di8 = bisect_left(d1_dates, day) - 1
+                v8_trend = di8 >= 0 and regime[di8] == 'TREND'
+            if variant == 'V9' and not v8_trend:
+                continue                            # V9 纯 TREND：非趋势日不进场
+            if variant in ('V1', 'V3') or (variant in ('V8', 'V9') and v8_trend):
                 # 1h「完结 + 形成中」序列：完结 1h bar（收盘 < 本窗口收盘）
                 # + 形成中 1h bar（当日 5m 聚合，含当前 bar）；快速路径同 15m
                 q60 = hour_win_close(m)
@@ -466,8 +705,11 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                     + 0.5 * pf1
                 if k1 < 1 or f60_last <= f1h_pre[k1 - 1]:
                     continue        # 1h 不在上行段
-            if variant in ('V2', 'V3', 'V5') and not (f15_last < V2_THRESHOLD):
-                continue                            # 15m 非深位（<-1.5）
+            if variant in ('V2', 'V3', 'V5') and not (f15_last < v2_threshold):
+                continue                            # 15m 非深位
+            if variant == 'V8' and not v8_trend \
+                    and not (f15_last < v2_threshold):
+                continue                            # V8-FALL 分支：深值才买
             if variant in ('V4', 'V5'):
                 # 日线趋势过滤（executor_t0.day_ok 口径）：只看完结日线，
                 # 形成中的当日 bar 不参与。回放严格取「进场日之前的完结
@@ -478,29 +720,33 @@ def replay(code, stop_mode, variant='V0', esi_delay=0, no_flat=False):
                     continue
                 if f1d[di] <= f1d[di - 1]:
                     continue
-            vol = max(100, int(FIXED_NOTIONAL / price / 100.0) * 100)
+            vol = max(100, int(nominal / price / 100.0) * 100)
             pos = [g, i, price, vol,
                    (STOP_PCT if stop_mode == 'fixed' else
-                    atr_cache.get(qkey)), 0, [], None]
-            last_buy_key = qkey
+                    atr_cache.get(qkey)), 0, [], None,
+                   (('TREND' if v8_trend else 'FALL')
+                    if variant in ('V8', 'V9') else None),
+                   f15_last]
+            last_buy_key = key_e
             n_trades += 1
         prev_close = bars[-1][1]['c']
     if no_flat and pos is not None:
         # 数据末尾仍持仓：按最后可得 close 盯市平仓（reason=END），仅 V6/V7
-        price = b5[-1]['c']
+        price = bd[-1]['c']
         gross = (price - pos[2]) * pos[3]
         fee = comm(pos[2], pos[3]) + comm(price, pos[3])
         trades.append({
-            'code': code, 'day': b5[-1]['time'][:10],
-            'entry': b5[pos[0]]['time'][11:16],
-            'exit': b5[-1]['time'][11:16],
+            'code': code, 'day': bd[-1]['time'][:10],
+            'entry': bd[pos[0]]['time'][11:16],
+            'exit': bd[-1]['time'][11:16],
             'buy': pos[2], 'sell': price,
             'gross': gross, 'fee': fee, 'net': gross - fee,
-            'reason': 'END', 'bars': len(b5) - 1 - pos[0],
-            'g_exit': len(b5) - 1, 'cost': pos[2], 'vol': pos[3],
+            'reason': 'END', 'bars': len(bd) - 1 - pos[0],
+            'g_exit': len(bd) - 1, 'cost': pos[2], 'vol': pos[3],
             'sp': (pos[4] if len(pos) > 4 else None),
             'nights': pos[5], 'gaps': list(pos[6]), 'flat_ref': pos[7],
-            'eday': b5[pos[0]]['time'][:10]})
+            'branch': pos[8] if len(pos) > 8 else None,
+            'eday': bd[pos[0]]['time'][:10]})
     return trades
 
 
@@ -725,10 +971,10 @@ def main():
           '本金/笔（vol=10000/价 取整百股，最低 100 股）；原四只的 V0 数字'
           '随之变化，旧口径四只版报告存档 '
           'results/backtest_t0_variants_report_4codes.txt。')
-    print('样本扩充注明（实验 G，2026-09-24）：5m/15m/1h/1d 已全量重拉'
-          '（2026-06-08 起，约 78 个交易日，厚 4.6 倍）——本报告全部数字'
-          '为厚样本重算，17 天旧数字见上一轮提交存档；pool_t0 已重建为 '
-          '9 只，严格宇宙相应变为 pool_t0 ∪ STRICT_EXTRA = 12 只。')
+    print('样本扩充注明（2026-09-29 起）：5m/15m/1h/1d 已按客户端本地库全深度'
+          '回填（5m 自 2024-11-15 起，约 460+ 交易日）——本报告全部数字为'
+          '厚样本重算，旧数字见 git 历史；pool_t0 已重建为 9 只，严格宇宙'
+          '相应变为 pool_t0 ∪ STRICT_EXTRA = 12 只。')
     all_trades = {}
     for mode in ('fixed', 'atr'):
         trades = []
@@ -1417,8 +1663,8 @@ def main():
 
     # ---------- 实验 G：厚样本复验（追加段，日期见标题行） ----------
     print('\n\n' + '#' * 64)
-    print('# 实验 G：厚样本复验（5m 约 78 个交易日，样本厚 4.6 倍）  %s'
-          % time.strftime('%Y-%m-%d'))
+    print('# 实验 G：厚样本复验（5m 约 %d 个交易日）  %s'
+          % (max(days.values()) if days else 0, time.strftime('%Y-%m-%d')))
     print('#' * 64)
     print('# 旧 17 天对照数字：宽宇宙 V2 +275.60（均笔 +0.93）；严格宇宙 V2 '
           '+646.40（均笔 +4.55）。严格宇宙已变为 pool_t0(9) ∪ STRICT_EXTRA'
@@ -1485,6 +1731,253 @@ def main():
               % (('厚' if thicker else '薄'), m_xa_g,
                  '维持 ESI_2 待实装观察' if thicker
                  else 'ESI_2 效应变薄，继续观察不实装'))
+
+    # ---------- 实验 H：名义本金/费用地板扫描（追加段，日期见标题行） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 H：名义本金扫描（费用地板量化，V0/V2 × 1/2/5/10 万）  %s'
+          % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+    print('%-4s %9s %7s %13s %9s %7s %13s %11s'
+          % ('变体', '名义/笔', '笔数', '总净额', '均笔', '胜率', '毛利',
+             '费用合计'))
+    for v in ('V0', 'V2'):
+        for nm in (10000.0, 20000.0, 50000.0, 100000.0):
+            ts = []
+            for code in universe:
+                ts.extend(replay(code, 'atr', v, nominal=nm))
+            st = agg_stats(ts)
+            fees = sum(t['fee'] for t in ts)
+            print('%-4s %9.0f %7d %+13.2f %+9.2f %6.1f%% %+13.2f %11.2f'
+                  % (v, nm, st[0], st[1], st[2], st[3], st[1] + fees, fees))
+    print('（毛利 = 净额 + 费用；佣金 max(5, 名义*0.00025) 双边。名义 ≥5 万时'
+          '地板佣占比 ≤0.01%%/边，策略毛利才能透出。）')
+
+    # ---------- 实验 I：ENTRY_DEEP_MIN 门槛扫描（追加段，日期见标题行） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 I：ENTRY_DEEP_MIN 深位门槛扫描（V2 口径，对照 V0）  %s'
+          % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+    print('%-10s %7s %13s %9s %7s %13s' % ('门槛', '笔数', '总净额(宽)', '均笔',
+                                            '胜率', '总净额(严格)'))
+    print('%-10s %7d %+13.2f %+9.2f %6.1f%% %+13.2f'
+          % ('V0(=999)', ve['V0'][0], ve['V0'][1], ve['V0'][2], ve['V0'][3],
+             ss0[1]))
+    for th in (-1.0, -1.5, -2.0, -2.5):
+        ts = []
+        for code in universe:
+            ts.extend(replay(code, 'atr', 'V2', v2_threshold=th))
+        st = agg_stats(ts)
+        stc = agg_stats([t for t in ts if t['code'] in strict])
+        print('%-10.1f %7d %+13.2f %+9.2f %6.1f%% %+13.2f'
+              % (th, st[0], st[1], st[2], st[3], stc[1]))
+    print('（笔数随门槛加深单调下降；总净额与均笔联合最优者为候选门槛。）')
+
+    # ---------- 实验 J：V8 REGIME-Conditional（追加段，日期见标题行） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 J：V8 REGIME-Conditional（TREND 浅位跟随+60m确认 / '
+          'FALL 深值反转）  %s' % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+    ts8 = []
+    for code in universe:
+        ts8.extend(replay(code, 'atr', 'V8'))
+    st8 = agg_stats(ts8)
+    ss8 = agg_stats([t for t in ts8 if t['code'] in strict])
+    tr8 = [t for t in ts8 if t.get('branch') == 'TREND']
+    fa8 = [t for t in ts8 if t.get('branch') == 'FALL']
+    print('%-14s %7s %13s %9s %7s' % ('组合', '笔数', '总净额', '均笔', '胜率'))
+    for label, s in (('V8 宽', st8), ('V8 严格', ss8),
+                     ('V0 宽(对照)', ve['V0']), ('V2 宽(对照)', ve['V2'])):
+        print('%-14s %7d %+13.2f %+9.2f %6.1f%%'
+              % (label, s[0], s[1], s[2], s[3]))
+    print('分支归因：TREND %d 笔 净额 %+.2f；FALL %d 笔 净额 %+.2f'
+          % (len(tr8), sum(t['net'] for t in tr8),
+             len(fa8), sum(t['net'] for t in fa8)))
+    base_best = max(ve['V0'][1], ve['V2'][1])
+    improve = st8[1] - base_best
+    ok_turn = st8[1] > 0
+    ok_n = st8[0] >= 300
+    ok_beat = improve >= 0.3 * abs(base_best) if base_best != 0 else st8[1] > 0
+    print('通过标准核对：池级转正=%s（%+.2f）；笔数≥300=%s（%d）；'
+          '比 max(V0,V2) 好 30%%=%s（max=%+.2f，V8 改善 %+.2f）'
+          % (ok_turn, st8[1], ok_n, st8[0], ok_beat, base_best, improve))
+    print('判定：%s'
+          % ('通过，建议实装 REGIME_MODE=on（白名单，默认 off）'
+             if (ok_turn and ok_n and ok_beat)
+             else '未通过，REGIME_MODE 保持不实装'))
+
+    # ---------- 实验 K：开关消融（追加段，日期见标题行） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 K：开关消融（基座=V2/atr，逐项关闭量贡献）  %s'
+          % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+    print('%-14s %7s %13s %9s %7s %13s' % ('组合', '笔数', '总净额', '均笔',
+                                            '胜率', '相对V2 Δ'))
+    for label, kw in (('V2 基座', {}),
+                      ('去5m闸门', {'use_gate': False}),
+                      ('去ESI快割', {'use_esi': False}),
+                      ('去硬止损', {'use_stop': False})):
+        ts = []
+        for code in universe:
+            ts.extend(replay(code, 'atr', 'V2', **kw))
+        st = agg_stats(ts)
+        print('%-14s %7d %+13.2f %+9.2f %6.1f%% %+13.2f'
+              % (label, st[0], st[1], st[2], st[3], st[1] - ve['V2'][1]))
+    print('（Δ>0 表示该组件是负贡献（去掉更好）；Δ<0 表示组件有正贡献。）')
+
+    # ---------- 实验 L：毛利分层尸检（找出正毛利在哪里；追加段） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 L：毛利分层尸检（V0 全样本，零费用视角；佣金率存活线 '
+          '= 均毛利%%/笔）  %s' % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+
+    def _gp(t):
+        return t['gross'] / (t['buy'] * t['vol']) * 100.0
+
+    def _bucket_report(title, keyf, order=None):
+        groups = defaultdict(list)
+        for t in vt['V0']:
+            groups[keyf(t)].append(t)
+        print('\n-- %s --' % title)
+        print('%-10s %7s %11s %11s %13s %13s'
+              % ('分层', '笔数', '均毛利%/笔', '扣0.05%后', '总毛利', '佣金存活线/边'))
+        keys = order if order else sorted(groups,
+                                          key=lambda k: -sum(_gp(t) for t in groups[k]) / len(groups[k]))
+        for k in keys:
+            g = groups.get(k)
+            if not g:
+                continue
+            mg = sum(_gp(t) for t in g) / len(g)
+            print('%-10s %7d %+10.3f%% %+10.3f%% %+13.2f %11.3f%%'
+                  % (k, len(g), mg, mg - 0.05, sum(t['gross'] for t in g),
+                     mg / 2.0))
+
+    _bucket_report('按年份', lambda t: t['eday'][:4])
+    _bucket_report('按进场 fish15 深度', lambda t: (
+        '<-4' if t['f15'] < -4 else
+        '-4~-3' if t['f15'] < -3 else
+        '-3~-2' if t['f15'] < -2 else
+        '-2~-1' if t['f15'] < -1 else
+        '-1~0' if t['f15'] < 0 else '>=0'),
+        order=['<-4', '-4~-3', '-3~-2', '-2~-1', '-1~0', '>=0'])
+    _bucket_report('按进场小时', lambda t: t['entry'][:2],
+        order=['09', '10', '11', '13', '14'])
+    _bucket_report('按票（降序）', lambda t: t['code'])
+    print('\n（「佣金存活线/边」= 该分层均毛利的一半（双边分摊）：实际佣金率'
+          '低于此值该层才有净空间；0.025%% 是当前万2.5 的每边费率。）')
+    tr_g = [_gp(t) for t in ts8 if t.get('branch') == 'TREND']
+    fa_g = [_gp(t) for t in ts8 if t.get('branch') == 'FALL']
+    if tr_g and fa_g:
+        print('V8 分支毛利：TREND 均毛利 %+.3f%%/笔（%d 笔）；FALL 均毛利 '
+              '%+.3f%%/笔（%d 笔）'
+              % (sum(tr_g) / len(tr_g), len(tr_g),
+                 sum(fa_g) / len(fa_g), len(fa_g)))
+
+    # ---------- 实验 M：V9 纯 TREND + 分样本子集验证（追加段） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 M：V9 纯 TREND 策略 + 分样本子集验证（选股用前半段，'
+          '验证用后半段）  %s' % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+    ts9 = []
+    for code in universe:
+        ts9.extend(replay(code, 'atr', 'V9'))
+    st9 = agg_stats(ts9)
+    print('%-16s %7s %13s %9s %7s' % ('组合', '笔数', '总净额', '均笔', '胜率'))
+    for label, s in (('V9 全窗口', st9), ('V8 全窗口(对照)', st8),
+                     ('V0 全窗口(对照)', ve['V0'])):
+        print('%-16s %7d %+13.2f %+9.2f %6.1f%%'
+              % (label, s[0], s[1], s[2], s[3]))
+    BUILD_END = '2025-08-31'
+    b9 = [t for t in ts9 if t['eday'] <= BUILD_END]
+    v9v = [t for t in ts9 if t['eday'] > BUILD_END]
+    bg = defaultdict(list)
+    for t in b9:
+        bg[t['code']].append(t)
+    rank = sorted(((c, len(g), sum(_gp(t) for t in g) / len(g))
+                   for c, g in bg.items() if len(g) >= 20),
+                  key=lambda x: -x[2])
+    print('\n-- build 窗口（~%s）V9 按票均毛利%%/笔排名（≥20 笔参评） --'
+          % BUILD_END)
+    print('%-8s %6s %11s' % ('code', '笔数', '均毛利%/笔'))
+    for c, n, mg in rank:
+        print('%-8s %6d %+10.3f%%' % (c, n, mg))
+    top = [c for c, _, mg in rank[:6] if mg > 0]
+    print('TOP 选取（前 6 且毛利为正）：%s' % (' '.join(top) if top else '无'))
+
+    def _row(label, ts):
+        if not ts:
+            print('%-26s %7s' % (label, '无样本'))
+            return
+        s = agg_stats(ts)
+        mg = sum(_gp(t) for t in ts) / len(ts)
+        print('%-26s %7d %+13.2f %+9.2f %6.1f%% %+10.3f%%'
+              % (label, s[0], s[1], s[2], s[3], mg))
+
+    print('\n-- 分样本验证（valid = %s 之后） --' % BUILD_END)
+    print('%-26s %7s %13s %9s %7s %11s'
+          % ('组合', '笔数', '总净额', '均笔', '胜率', '均毛利%/笔'))
+    _row('build 全宇宙 V9', b9)
+    _row('valid 全宇宙 V9', v9v)
+    _row('valid TOP票 V9', [t for t in v9v if t['code'] in top])
+    _row('valid TOP票 仅13/14点',
+         [t for t in v9v if t['code'] in top
+          and t['entry'][:2] in ('13', '14')])
+    _row('valid 全宇宙 V0(对照)',
+         [t for t in vt['V0'] if t['eday'] > BUILD_END])
+    _row('valid 全宇宙 V2(对照)',
+         [t for t in vt['V2'] if t['eday'] > BUILD_END])
+    print('（时段过滤为事后过滤近似：忽略禁入/再进场连锁；TOP 选股只用 '
+          'build 窗口信息，valid 窗口纯外推。）')
+
+    # ---------- 实验 N：V10 降频（30m 阶梯） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 N：V10 降频（30m cross 进场 + 15m 闸门，15m cross 出场）  %s'
+          % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+    ts10 = []
+    for code in universe:
+        ts10.extend(replay(code, 'atr', 'V10'))
+    st10 = agg_stats(ts10)
+    fee10 = sum(t['fee'] for t in ts10)
+    print('%-16s %7s %13s %9s %7s %11s %11s'
+          % ('组合', '笔数', '总净额', '均笔', '胜率', '均毛利%/笔', '费用合计'))
+    for label, s, ts in (('V10 降频', st10, ts10), ('V0(对照)', ve['V0'], vt['V0']),
+                         ('V2(对照)', ve['V2'], vt['V2'])):
+        mg = sum(_gp(t) for t in ts) / len(ts) if ts else 0.0
+        print('%-16s %7d %+13.2f %+9.2f %6.1f%% %+10.3f%% %11.2f'
+              % (label, s[0], s[1], s[2], s[3], mg,
+                 sum(t['fee'] for t in ts)))
+    print('（降频逻辑：交易次数下降 → 费用占比下降；但单笔毛利需同步放大'
+          '才有净收益。ATR 仍按 15m 计算。）')
+
+    # ---------- 实验 O：1m 级别（V11 保真 / V11-ESI1m / V12 原生） ----------
+    print('\n\n' + '#' * 64)
+    print('# 实验 O：1m 级别（V11 1m驱动双闸门保真 / V11+ESI=1m / '
+          'V12 1m原生快阶梯）  %s' % time.strftime('%Y-%m-%d'))
+    print('#' * 64)
+    ts11, ts11e, ts12 = [], [], []
+    for code in universe:
+        ts11.extend(replay(code, 'atr', 'V11'))
+        ts11e.extend(replay(code, 'atr', 'V11', esi_tf='1m'))
+        ts12.extend(replay(code, 'atr', 'V12'))
+    if not (ts11 or ts11e or ts12):
+        print('（无 1m 缓存，跳过：tdxq_fetch --period 1m 回填后可跑）')
+    else:
+        print('%-18s %7s %13s %9s %7s %11s'
+              % ('组合', '笔数', '总净额', '均笔', '胜率', '均毛利%/笔'))
+        for label, ts in (('V11(ESI=5m)', ts11), ('V11(ESI=1m)', ts11e),
+                          ('V12 原生', ts12)):
+            s = agg_stats(ts)
+            mg = sum(_gp(t) for t in ts) / len(ts) if ts else 0.0
+            print('%-18s %7d %+13.2f %+9.2f %6.1f%% %+10.3f%%'
+                  % (label, s[0], s[1], s[2], s[3], mg))
+        first_day = min(t['eday'] for t in (ts11 or ts12))
+        v0_same = [t for t in vt['V0'] if t['eday'] >= first_day]
+        s = agg_stats(v0_same)
+        mg = sum(_gp(t) for t in v0_same) / len(v0_same) if v0_same else 0.0
+        print('%-18s %7d %+13.2f %+9.2f %6.1f%% %+10.3f%%'
+              % ('V0 同窗口对照', s[0], s[1], s[2], s[3], mg))
+        print('（1m 缓存仅约 100 个交易日：样本偏薄，结论用于判断 1m 粒度'
+              '是否改变方向，不用于挖掘新边际。窗口起点 %s。）' % first_day)
 
 
 if __name__ == '__main__':
