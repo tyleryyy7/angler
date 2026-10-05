@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--codes-file")
     ap.add_argument("--period", default="1h")
     ap.add_argument("--count", type=int, default=800)
+    ap.add_argument("--batch", type=int, default=BATCH,
+                    help="max codes per get_market_data call")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--universe", action="store_true",
                     help="write universe lists (A-share '5' + ETF '31') to out-dir/universe.csv")
@@ -104,8 +106,8 @@ def main():
                         print("[ERR] name %s: %s" % (c, e))
             print("DONE names=%d" % len(codes))
             return
-        for i in range(0, len(codes), BATCH):
-            chunk = codes[i:i + BATCH]
+        for i in range(0, len(codes), args.batch):
+            chunk = codes[i:i + args.batch]
             try:
                 df = tq.get_market_data(stock_list=chunk, period=args.period,
                                         count=args.count, dividend_type="front")

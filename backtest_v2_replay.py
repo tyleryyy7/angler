@@ -147,7 +147,16 @@ def small_tf_down(tf, bars, i, day, m, winc):
 
 
 def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
-           esi_min_loss=0.0, min_cross=MIN_CROSS, max_f60=999.0):
+           esi_min_loss=0.0, min_cross=MIN_CROSS, max_f60=999.0,
+           min_cross_sell=None, add_pct=None, max_adds=2, add_regime=None,
+           t0=False, entry_regime=None):
+    # add_pct: 顺势加仓开关（验证用近似口径）。持仓浮盈 >= add_pct 且盘中再出
+    # 1h 上穿（同一 1h 窗口不重复）→ 加 1 单位，最多 max_adds 次；加仓笔随主仓
+    # 同价离场、单独记账（reason 带 |ADD），T+1 对加仓笔当日不可卖的细节忽略。
+    # add_regime: 加仓额外要求日线 regime=TREND（'ma20'/'ma10'/'dif'）。
+    # entry_regime: 主仓进场额外要求日线 regime=TREND（动态强弱闸门）。
+    # t0=True: T+0 标的（QDII/债券/商品 ETF），当日买入当日可卖（无冻结锁存）。
+    sell_mc = MIN_CROSS if min_cross_sell is None else min_cross_sell
     b5 = load_bars(code, '5m')
     if len(b5) < MIN_5M_BARS:
         return []
@@ -155,13 +164,18 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
     tf30 = TF(load_bars(code, '30m'))
     tf15 = TF(load_bars(code, '15m'))
     tf5 = TF(b5)
-    if variant == 'G_REGIME_ESI':
-        rg_dates, rg_arr = build_regime(load_bars(code, '1d'), regime_mode)
+    if (variant == 'G_REGIME_ESI' or add_regime is not None
+            or entry_regime is not None):
+        rg_dates, rg_arr = build_regime(
+            load_bars(code, '1d'),
+            regime_mode if variant == 'G_REGIME_ESI'
+            else (add_regime or entry_regime))
     by_day = defaultdict(list)
     for g, b in enumerate(b5):
         by_day[b['time'][:10]].append((g, b))
     trades = []
     pos = None          # [entry_g, cost, vol, entry_day, entry_f60, entry_hhmm]
+    lots = []           # 加仓笔 [g, price, vol, day, f60, hhmm, delta]
     pending = None      # R2：假性失效信号（key=1h 窗口）
     psell = None        # Exit A 挂起（key=1h 窗口）
     exdef = None        # T+1 冻结期锁存的出场原因
@@ -172,7 +186,8 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
         if not bars:
             continue
         rg_T = False
-        if variant == 'G_REGIME_ESI':
+        if (variant == 'G_REGIME_ESI' or add_regime is not None
+                or entry_regime is not None):
             # regime 判定用「进场日之前的完结日线」（date < day，无前视）
             di = bisect_left(rg_dates, day) - 1
             rg_T = di >= 0 and rg_arr[di] == 'TREND'
@@ -187,14 +202,14 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
             cross_down = f60_m2 is not None and f60 < t60 and t60 >= f60_m2
 
             if pos is not None:
-                sellable = day != pos[3]
+                sellable = t0 or day != pos[3]
                 reason = None
                 _, f30l, f30m1, f30m2 = tf30.last(bars, i, day, m, win_close_30)
                 cd30 = f30m2 is not None and f30l < f30m1 and f30m1 >= f30m2
                 if variant == 'A_OLD':
                     cd60 = cross_down          # 旧口径：下穿无幅度门槛
                 else:
-                    cd60 = cross_down and (t60 - f60) >= MIN_CROSS
+                    cd60 = cross_down and (t60 - f60) >= sell_mc
                     if variant == 'F_NOXSELL':
                         cd60 = cross_down
                 if not sellable:
@@ -260,8 +275,29 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                         'branch': pos[6] if len(pos) > 6 else None,
                         'delta': pos[7] if len(pos) > 7 else None,
                         'eday': pos[3]})
+                    for lt in lots:
+                        lg = (price - lt[1]) * lt[2]
+                        lf = fee_buy(lt[1], lt[2]) + fee_sell(price, lt[2])
+                        trades.append({
+                            'code': code, 'day': day, 'entry': lt[5],
+                            'exit': hhmm, 'buy': lt[1], 'sell': price,
+                            'gross': lg, 'fee': lf, 'net': lg - lf,
+                            'reason': reason + '|ADD', 'vol': lt[2],
+                            'bars': g - lt[0], 'g_exit': g,
+                            'hold_days': (day != lt[3]), 'f60': lt[4],
+                            'branch': None, 'delta': lt[6], 'eday': lt[3]})
                     pos = None
                     psell = None
+                    lots = []
+                elif (add_pct is not None and len(lots) < max_adds
+                        and ENTRY_FROM <= hhmm <= ENTRY_TO
+                        and price >= pos[1] * (1.0 + add_pct)
+                        and (add_regime is None or rg_T)
+                        and cross_up and f60 < max_f60
+                        and key1h != last_buy_key):
+                    avol = max(100, int(nominal / price / 100.0) * 100)
+                    lots.append([g, price, avol, day, f60, hhmm, f60 - t60])
+                    last_buy_key = key1h
                 continue
 
             # ---- 空仓进场侧 ----
@@ -269,8 +305,8 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                 continue
             # R2 激活监控
             if pending is not None:
-                if f60 < t60:
-                    pending = None               # 1h 趋势破坏，作废
+                if f60 < t60 or (entry_regime is not None and not rg_T):
+                    pending = None               # 1h 趋势破坏 / 转入非 TREND，作废
                 else:
                     d15 = small_tf_down(tf15, bars, i, day, m, win_close)
                     d30 = small_tf_down(tf30, bars, i, day, m, win_close_30)
@@ -284,10 +320,13 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                                 if variant == 'G_REGIME_ESI' else None),
                                f60 - t60]
                         pending = None
+                        lots = []
                         last_buy_key = key1h
                         continue
             if not cross_up or last_buy_key == key1h:
                 continue
+            if entry_regime is not None and not rg_T:
+                continue                           # 动态强弱闸门：非 TREND 日不进场
             if variant != 'B_NOX' and (f60 - t60) < min_cross:
                 continue                           # 穿越幅度不足，忽略
             if f60 >= max_f60:
@@ -306,6 +345,7 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
                    (('TREND' if rg_T else 'FALL')
                     if variant == 'G_REGIME_ESI' else None),
                    f60 - t60]
+            lots = []
             last_buy_key = key1h
     # 数据末尾仍持仓：盯市平仓
     if pos is not None:
@@ -323,6 +363,18 @@ def replay(code, variant='V0', nominal=10000.0, regime_mode='ma20',
             'delta': pos[7] if len(pos) > 7 else None,
             'hold_days': True,
             'f60': pos[4], 'eday': pos[3]})
+        for lt in lots:
+            lg = (price - lt[1]) * lt[2]
+            lf = fee_buy(lt[1], lt[2]) + fee_sell(price, lt[2])
+            trades.append({
+                'code': code, 'day': by_day[sorted(by_day)[-1]][-1][1]['time'][:10],
+                'entry': lt[5], 'exit': b5[-1]['time'][11:16],
+                'buy': lt[1], 'sell': price,
+                'gross': lg, 'fee': lf, 'net': lg - lf,
+                'reason': 'END|ADD', 'vol': lt[2], 'bars': len(b5) - 1 - lt[0],
+                'g_exit': len(b5) - 1,
+                'branch': None, 'delta': lt[6],
+                'hold_days': True, 'f60': lt[4], 'eday': lt[3]})
     return trades
 
 

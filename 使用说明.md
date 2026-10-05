@@ -324,6 +324,15 @@ Get-ScheduledTask -TaskName "任务名" | ForEach-Object { $_.Settings.StartWhen
 R2 假性失效观察（被拦票进待激活，三周期回上行且 1h 未破 → 激活买入，1h 破趋势 → 作废）；
 离场 = 1h 下穿全卖（USE_EXIT_A）+ R3 亏损即卖（30m 下穿且现价 < 成本，USE_ESI_EXIT）。
 
+**REV 2026-10-05b（全市场 904 只回放验证后的规则升级）**：
+- 卖出下穿幅度门槛分品种：股票 0.50 / ETF 0.15（`SELL_MC_STOCK/SELL_MC_ETF`，可热调）；
+- 仓位分档（股票，watchlist 的 VOLUME = 1 单位）：进场 f60<0 下 2 单位、0≤f60<1 下 1 单位、
+  f60≥1 不进场、13:00 后一律减半（取整百股）；
+- 顺势加仓（股票）：持仓浮盈 ≥1% 且日线 MA20 趋势态且盘中再出 1h 上穿 → 加 1 单位，
+  每仓最多 3 次（`USE_ADDS/ADD_PCT/MAX_ADDS` 可热调，台账 D:\qmt\adds.csv）；
+- 动态刹车：`D:\qmt\v2_blocklist.txt` 名单内票只卖不买（theme_brake.py 每月 1 日生成）；
+- 原 MAX_F60 进场上限已移除（被分档的 f60≥1 跳过取代）。
+
 ### 部署
 1. 在 QMT 客户端策略编辑器里**全选粘贴**仓库 `executor_v2.py` 内容（sync_qmt 一键同步已失效删除：
    客户端对 python\ 目录有文件虚拟化，外部写入客户端不可见）。源文件 UTF-8、纯 ASCII、

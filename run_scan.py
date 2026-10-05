@@ -152,10 +152,34 @@ def _pct_change(code6, mi=None):
     return None
 
 
+def _load_blocklist():
+    """动态刹车名单（theme_brake.py 生成；文件不存在=不刹车）。"""
+    try:
+        with open(r"D:\qmt\v2_blocklist.txt", encoding="utf-8") as f:
+            return set(ln.strip().split()[0] for ln in f
+                       if ln.strip() and not ln.startswith("#"))
+    except Exception:
+        return set()
+
+
+def _sz4_tier(code, f60):
+    """SZ4 仓位档（REV 2026-10-05b 口径，仅股票）：f60<0 2x / 0~1 1x / >=1 不进场。
+    返回档位标注文本；ETF 与日K 行不标注（由调用方控制）。"""
+    if not code.startswith(("60", "00")):
+        return ""
+    if f60 < 0:
+        return "档2x"
+    if f60 < 1:
+        return "档1x"
+    return "档0·不进场"
+
+
 def _fmt_candidate(r, pool_row, info):
     """一条候选卡片：三行短句（代码名加粗作锚点）——行情 | 信号细节 | 打分/HSSR+基本面。"""
     code = str(r["code"]).zfill(6)
     line1 = "**%s %s**" % (code, r["name"])
+    if code in _load_blocklist():
+        line1 += " 🔴刹车"
     close = r.get("close")
     if close:
         line1 += " %.2f" % float(close)
@@ -180,6 +204,13 @@ def _fmt_candidate(r, pool_row, info):
     if r.get("small_tf"):
         sig += "(%s)" % r["small_tf"]
     seg2.append(sig)
+    if r.get("bar_state") != "日K上穿":   # SZ4 档位基于 60m f60，日K行不适用
+        try:
+            tier = _sz4_tier(code, float(r["fisher"]))
+            if tier:
+                seg2.append(tier)
+        except (TypeError, ValueError):
+            pass
     seg3 = []
     if pool_row is not None:
         if pd.notna(pool_row.get("score")) and str(pool_row.get("score")) != "":
@@ -390,6 +421,16 @@ def post_close_candidates(target_date=None):
                                     for d in daily_hits]))
     if frames:
         out = pd.concat(frames, ignore_index=True)
+        bl = _load_blocklist()
+        def _tier(row):
+            if str(row.get("bar_state")) == "日K上穿":
+                return ""
+            try:
+                return _sz4_tier(str(row["code"]).zfill(6), float(row["fisher"]))
+            except (TypeError, ValueError, KeyError):
+                return ""
+        out["sz4"] = out.apply(_tier, axis=1)
+        out["brake"] = [int(str(c).zfill(6) in bl) for c in out["code"]]
         path = BASE / "results" / ("candidates_%s.csv" % day.strftime("%Y%m%d"))
         out.to_csv(path, index=False, encoding="utf-8-sig")
         logging.info("候选清单已保存: %s", path)

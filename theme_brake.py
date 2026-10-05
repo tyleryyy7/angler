@@ -1,0 +1,123 @@
+# -*- coding: utf-8 -*-
+"""theme_brake.py — 动态刹车（每月运行）：watchlist 逐票 trailing 3 个月回放，
+净额为负且笔数足够 → 写入 D:\qmt\v2_blocklist.txt，executor_v2 每 bar 热读，
+名单内票只管理卖出不进新仓。结果推送企业微信。
+
+口径：回放整段缓存但只统计进场日在最近 63 个交易日内的交易（LIVE 规则：
+E_NOESI + 进场门槛0 + cap2.5 + 卖门槛0.15——与线上现行一致；线上改规则后
+这里要同步改 PARAMS）。票级数据只覆盖窗口内新开仓，窗口前开仓跨期持有的
+交易不计（刹车看的是"最近新信号质量"，不是存量持仓损益）。
+
+用法：.venv\\Scripts\\python.exe theme_brake.py [--no-push] [--days 63]
+"""
+import argparse
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE))
+
+TDXQ_FETCH = r"D:\tdx\PYPlugins\user\tdxq_fetch.py"
+DATA_DIR = BASE / 'cache' / 'daily_qfq' / 'tdxq'
+WATCHLIST = r'D:\qmt\watchlist.txt'
+BLOCKLIST = r'D:\qmt\v2_blocklist.txt'
+
+PARAMS = dict(variant='E_NOESI', min_cross=0.0, max_f60=1.0,
+              min_cross_sell=0.50)          # REV 2026-10-05b 线上规则
+                                            # （max_f60=1.0 近似 SZ4 的 f60>=1 跳过；
+                                            # 分档倍率/加仓在刹车评估里从简）
+MIN_TRADES = 5                              # 窗口内笔数下限（少于则样本不足不判）
+FETCH_COUNTS = {'5m': 4500, '15m': 1600, '30m': 900, '1h': 600, '1d': 150}
+
+
+def load_watchlist():
+    codes = []
+    with open(WATCHLIST, encoding='utf-8') as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith('#'):
+                continue
+            codes.append(ln.split(',')[0].strip().split('.')[0])
+    return codes
+
+
+def refresh(codes):
+    """补取各周期缓存（merge 写，不冲深度）。"""
+    cf = DATA_DIR / '_brake_codes.txt'
+    cf.parent.mkdir(parents=True, exist_ok=True)
+    cf.write_text('\n'.join(codes), encoding='utf-8')
+    for period, cnt in FETCH_COUNTS.items():
+        r = subprocess.run(
+            [sys.executable, TDXQ_FETCH, '--codes-file', str(cf),
+             '--period', period, '--count', str(cnt), '--batch', '25',
+             '--out-dir', str(DATA_DIR)],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=1800)
+        tail = (r.stdout or '').strip().splitlines()
+        print('[fetch %s] %s' % (period, tail[-1] if tail else '(no output)'))
+
+
+def judge(codes, days):
+    import backtest_t0_replay as t0
+    import backtest_v2_replay as br
+    rows = []
+    for code in codes:
+        if not all((DATA_DIR / ('%s_%s.csv' % (code, p))).exists()
+                   for p in ('5m', '15m', '30m', '1h')):
+            rows.append((code, 0, 0.0, 0.0, '数据缺失'))
+            continue
+        b5 = t0.load_bars(code, '5m')
+        cal = sorted({b['time'][:10] for b in b5})
+        cutoff = cal[-days] if len(cal) > days else cal[0]
+        ts = [t for t in br.replay(code, **PARAMS) if t['eday'] >= cutoff]
+        n = len(ts)
+        net = sum(t['net'] for t in ts)
+        win = sum(1 for t in ts if t['net'] > 0) * 100.0 / n if n else 0.0
+        verdict = ('刹车' if n >= MIN_TRADES and net < 0 else
+                   '样本不足' if n < MIN_TRADES else '正常')
+        rows.append((code, n, net, win, verdict))
+    return rows, cutoff
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--no-push', action='store_true')
+    ap.add_argument('--days', type=int, default=63)
+    args = ap.parse_args()
+
+    codes = load_watchlist()
+    print('watchlist %d 只，trailing %d 个交易日' % (len(codes), args.days))
+    refresh(codes)
+    rows, cutoff = judge(codes, args.days)
+
+    blocked = [r for r in rows if r[4] == '刹车']
+    lines = ['# dynamic brake list (theme_brake.py %s, window from %s, LIVE rules)'
+             % (datetime.now().strftime('%Y-%m-%d'), cutoff)]
+    for code, n, net, win, verdict in rows:
+        if verdict == '刹车':
+            lines.append('%s  # n=%d net=%+.0f win=%.0f%%' % (code, n, net, win))
+    with open(BLOCKLIST, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+
+    msg = ['**动态刹车月报**（窗口自 %s，%d 个交易日，现行规则回放）'
+           % (cutoff, args.days), '']
+    for code, n, net, win, verdict in rows:
+        mark = {'刹车': '🔴', '正常': '🟢', '样本不足': '⚪',
+                '数据缺失': '⚫'}[verdict]
+        msg.append('%s %s：%d 笔 %+.0f（胜率 %.0f%%）'
+                   % (mark, code, n, net, win))
+    msg.append('')
+    msg.append('刹车 %d 只：%s' % (len(blocked),
+                                  ' '.join(r[0] for r in blocked) or '无'))
+    text = '\n'.join(msg)
+    print(text)
+    if not args.no_push:
+        from fisher_scanner import push_text
+        push_text(text)
+
+
+if __name__ == '__main__':
+    main()

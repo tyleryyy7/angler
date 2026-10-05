@@ -2,14 +2,20 @@
 # qmt_executor_v2.py - big-QMT built-in strategy, aligned with scanner Fisher-ESI rules v2.
 #
 # Entry (R1): 1h fisher cross UP and none of 30m/15m/5m is in down state
-#             (fish < trigger) and no position -> buy VOLUME shares.
+#             (fish < trigger) and no position -> buy. Size = SZ4 (stocks):
+#             f60<0 -> 2 units, 0<=f60<1 -> 1 unit, f60>=1 -> skip; x0.5
+#             after 13:00 (watchlist VOLUME = 1 unit).
+# Add       : while holding, floating >= ADD_PCT and daily MA20-TREND and a
+#             fresh 1h cross-up -> add 1 unit, max MAX_ADDS (stocks only).
 # Exit A    : mirrors the entry side: 1h fisher cross DOWN with magnitude
-#             (trigger - fish) >= MIN_CROSS and ALL of 15m/30m/5m in down state
+#             (trigger - fish) >= sell_mc(code) (stocks 0.50 / ETF 0.15)
+#             and ALL of 15m/30m/5m in down state
 #             -> sell all. Hairline down-crosses are ignored; small tfs not all
 #             down = fake-invalid exit -> defer + watch, void if 1h fish
 #             recovers above its trigger.
 # Exit B(R3): latest completed 30m bar cross DOWN and current price < cost -> sell all
 #             immediately (failed trade); floating profit -> keep holding for Exit A.
+#             (stocks: ESI off; T0 ETFs: ESI on - see esi_enabled)
 #
 # Fisher: Pine/THS standard, hl2 input, window 9 - bit-identical to fisher_scanner.py.
 # Pure ASCII, Python 3.6, save as UTF-8. All file paths must be ASCII-only.
@@ -32,16 +38,32 @@ LENGTH = 9                   # fisher window
 HIST_BARS = 120              # bars fetched per timeframe per call
 VOLUME = 100                 # default shares per BUY order (per-code override in watchlist)
 USE_ENTRY_GATE = True        # R1: small-timeframe resonance gate (30m/15m/5m not down)
-MIN_CROSS = 0.15             # SELL-side magnitude floor only (exit, 09-29b).
+SELL_MC_STOCK = 0.50         # sell-side 1h down-cross magnitude floor, stocks.
+                             # Full-market 904-code x 10.5mo sweep (2026-10-05):
+                             # valid window peaks at 0.35~0.50 (+12% vs 0.15);
+                             # the 1-2-day loser bucket (-4.4M at 0.15) shrinks
+                             # to -0.13M at 0.50. 0.75+ degenerates to buy&hold.
+SELL_MC_ETF = 0.15           # ETFs keep 0.15: on the T0-ETF universe S050 is
+                             # slightly worse than 0.15 (+162k vs +181k).
 MIN_CROSS_ENTRY = 0.0        # entry floor REMOVED 2026-09-30: thick-sample sweep
                              # (231 codes x 10.5mo, ESI-off base) monotone -
                              # 0.00 beats 0.15 by +127k; hairline bucket win rate
                              # lower (42% vs 46%) but expectancy +0.27%/trade.
                              # HSSR old study measured win rate only.
-MAX_F60 = 2.5                # entry cap: fish60 >= 2.5 skipped (high-position
-                             # bucket gross negative, 2026 alone -19k; caps
-                             # 1.5/2.0/2.5 statistically tied, 2.5 matches the
-                             # scanner esi_register convention)
+SZ4_SIZING = True            # position sizing (stocks only), full-market
+                             # capital-neutral valid +24~37% (2026-10-05):
+                             # f60 < 0 -> 2 units; 0<=f60<1 -> 1 unit;
+                             # f60 >= 1 -> skip entry; 13:00+ -> x0.5.
+USE_ADDS = True              # pyramid adds (stocks only): while holding, floating
+                             # >= ADD_PCT and daily MA20-TREND and a fresh 1h
+                             # cross-up -> add 1 unit, max MAX_ADDS per position.
+                             # Validated 2026-10-05: add lots +2.96%/trade, 55%
+                             # win rate under S050 base; MA20 gate makes chop
+                             # (2024) add-lots neutral. ETF adds weak -> off.
+ADD_PCT = 0.01
+MAX_ADDS = 3
+ADDS_FILE = r'D:\qmt\adds.csv'             # code,count,REV add-lot ledger
+ADDS_PATH = ADDS_FILE        # backtest runs get a separate ledger (set in init)
 ENTRY_TO = '14:40'           # no fresh entries after this time: 15:00-bar signals
                              # are the worst time bucket (ret10 ~-0.4~-0.7%, HSSR
                              # ~38-44%). Mirrors executor_t0 ENTRY_TO.
@@ -60,8 +82,8 @@ EXIT_CONFIRM_TFS = ('15m', '30m', '5m')   # Exit A sell gate (mirrors the entry
                              # gate): sell only when ALL these small tfs are in
                              # down state; otherwise fake-invalid exit -> defer
                              # + watch (PSELL), void if 1h fish recovers above
-                             # its trigger. Down-crosses thinner than MIN_CROSS
-                             # are ignored entirely (same floor as entries).
+                             # its trigger. Down-crosses thinner than sell_mc(code)
+                             # are ignored entirely.
 OPEN_GUARD_UNTIL = '09:35'   # no orders before this time: at the 09:30 open the
                              # forming 1h bar holds a single tick (high==low) and
                              # cross readings on it are degenerate, and the trade
@@ -75,20 +97,31 @@ ETF_ENTRIES = True             # ETF (non 60/00) NEW-ENTRY switch; False = manag
                              # CONFIG_FILE every handlebar (no restart needed).
 CONFIG_FILE = r'D:\qmt\v2_config.txt'   # optional KEY=VALUE lines, whitelisted:
                                         #   ETF_ENTRIES=0|1
-REV = '2026-09-30c'              # bumped on every repo edit; printed in the start
+                                        #   SELL_MC_STOCK / SELL_MC_ETF (float)
+                                        #   USE_ADDS=0|1, MAX_ADDS (int),
+                                        #   ADD_PCT (float)
+BLOCKLIST_FILE = r'D:\qmt\v2_blocklist.txt'  # 动态刹车名单（theme_brake.py 每月
+                                        # 生成）：一行一个 code，名单内票只管理
+                                        # 卖出、不进新仓（含加仓）。每 handlebar 热读。
+BLOCKLIST = set()
+REV = '2026-10-05b'              # bumped on every repo edit; printed in the start
                                  # banner so the deployed copy's version is always
                                  # identifiable from the client log (a stale paste
                                  # once ran silently for a whole day)
 # ----------------------------------------
 
 CODES = []
-VOL_MAP = {}                 # code -> per-stock buy volume
+VOL_MAP = {}                 # code -> per-stock buy volume of ONE UNIT
 T0_SET = set()               # codes allowed to sell same-day (T+0 instruments)
 LAST_ACT = {}                # (code, action) -> fisher-state key, dedup per bar
 PENDING = {}                 # code -> signal_key of fake-invalid signal (persisted to
                              # PENDING_FILE on every change, reloaded in init)
 SIM_POS = {}                 # code -> [vol, cost, buy_date], simulation-mode ledger;
                              # real account positions always take precedence
+ADDS = {}                    # code -> add count for the current position
+                             # (persisted to ADDS_FILE, reset when flat)
+REGIME_CACHE = {}            # code -> (yyyymmdd, is_trend): daily MA20 regime,
+                             # recomputed once per day per code
 LAST_PRINT = {}              # code -> last printed 1h fisher key (log throttle)
 MD2_WARNED = set()           # market_data2 empty-result warnings already printed
 PSELL = {}                   # code -> key1h of deferred Exit A (sell gate not
@@ -248,10 +281,95 @@ def esi_enabled(code):
     return is_etf(code)
 
 
+def sell_mc(code):
+    # sell-side 1h down-cross magnitude floor, per instrument (2026-10-05)
+    return SELL_MC_ETF if is_etf(code) else SELL_MC_STOCK
+
+
+def entry_mult(code, f60, hhmm):
+    # SZ4 sizing, stocks only (ETF evidence weak, stay 1x). 0.0 = skip entry.
+    if is_etf(code) or not SZ4_SIZING:
+        return 1.0
+    if f60 >= 1.0:
+        return 0.0
+    m = 2.0 if f60 < 0.0 else 1.0
+    if hhmm >= '13:00':
+        m *= 0.5
+    return m
+
+
+def sized_vol(code, mult):
+    v = int(VOL_MAP.get(code, VOLUME) * mult / 100.0) * 100
+    return max(v, 0)
+
+
+def regime_trend(ContextInfo, code):
+    # daily MA20 regime state machine, same spec as backtest build_regime:
+    # raw = close > MA20 and MA20 rising 2 days; TREND needs 2 consecutive raw
+    # (hysteresis); only COMPLETED daily bars (drop the forming one).
+    # Cached per (code, day) - recomputed once a day.
+    today = bar_date(ContextInfo)
+    hit = REGIME_CACHE.get(code)
+    if hit and hit[0] == today:
+        return hit[1]
+    out = None
+    try:
+        closes = get_hist(ContextInfo, code, '1d', 'close')
+        if len(closes) > 25:
+            closes = closes[:-1]       # drop the forming daily bar
+        if len(closes) >= 24:
+            n = len(closes)
+            ma = [None] * 19 + [sum(closes[i - 19:i + 1]) / 20.0
+                                for i in range(19, n)]
+            raw = [False] * n
+            for i in range(21, n):
+                raw[i] = (closes[i] > ma[i] and ma[i] > ma[i - 1]
+                          and ma[i - 1] > ma[i - 2])
+            cur = False
+            for i in range(1, n):
+                if raw[i] and raw[i - 1]:
+                    cur = True
+                elif not raw[i] and not raw[i - 1]:
+                    cur = False
+            out = cur
+    except Exception as e:
+        print('[WARN] %s regime failed: %s' % (code, e))
+    REGIME_CACHE[code] = (today, out)
+    return out
+
+
+def adds_load():
+    out = {}
+    try:
+        f = open(ADDS_PATH, 'r', encoding='utf-8')
+        for ln in f:
+            ln = ln.strip()
+            if ln and not ln.startswith('#'):
+                parts = ln.split(',')
+                rev = parts[2].strip() if len(parts) > 2 else ''
+                if rev != REV:
+                    continue        # ledger from another ruleset: drop
+                out[parts[0].strip()] = int(parts[1])
+        f.close()
+    except Exception:
+        pass
+    return out
+
+
+def adds_save():
+    try:
+        f = open(ADDS_PATH, 'w', encoding='utf-8')
+        for code, n in ADDS.items():
+            f.write('%s,%d,%s\n' % (code, n, REV))
+        f.close()
+    except Exception as e:
+        print('[WARN] adds save failed: %s' % e)
+
+
 def config_override():
     # optional KEY=VALUE lines, whitelisted keys only; re-read every handlebar
     # so ETF_ENTRIES flips take effect intraday without a strategy restart
-    global ETF_ENTRIES
+    global ETF_ENTRIES, BLOCKLIST
     try:
         f = open(CONFIG_FILE, 'r', encoding='utf-8')
         for ln in f:
@@ -265,7 +383,29 @@ def config_override():
                 if new != ETF_ENTRIES:
                     print('[CONFIG] ETF_ENTRIES %s -> %s' % (ETF_ENTRIES, new))
                     ETF_ENTRIES = new
+            elif k in ('SELL_MC_STOCK', 'SELL_MC_ETF', 'ADD_PCT'):
+                try:
+                    globals()[k] = float(v)
+                except ValueError:
+                    pass
+            elif k == 'MAX_ADDS':
+                try:
+                    globals()['MAX_ADDS'] = int(v)
+                except ValueError:
+                    pass
+            elif k == 'USE_ADDS':
+                globals()['USE_ADDS'] = v not in ('0', 'false', 'False', 'no')
         f.close()
+    except Exception:
+        pass
+    try:
+        with open(BLOCKLIST_FILE, 'r', encoding='utf-8') as f:
+            new_bl = set(ln.strip().split()[0] for ln in f
+                         if ln.strip() and not ln.startswith('#'))
+        if new_bl != BLOCKLIST:
+            print('[CONFIG] blocklist %d -> %d codes' % (len(BLOCKLIST),
+                                                         len(new_bl)))
+            BLOCKLIST = new_bl
     except Exception:
         pass
 
@@ -320,7 +460,13 @@ def verify_fills(ContextInfo):
             continue
         del VERIFY[code]
         if side == 'BUY' and pos <= base and code in SIM_POS:
-            simpos_on_sell(code)           # phantom entry, never really bought
+            if tag == 'ADD' and len(rec) > 6:
+                simpos_add_rollback(code, rec[6])   # 加仓失败只回滚加仓部分
+            else:
+                simpos_on_sell(code)           # phantom entry, never really bought
+        if side == 'BUY' and tag == 'ADD' and pos <= base:
+            ADDS[code] = max(0, ADDS.get(code, 1) - 1)   # 失败不占加仓名额
+            adds_save()
         msg = ('QMT FILL FAIL: %s %s x%d not filled after retry '
                '(pos %d, base %d), manual check needed'
                % (side, code, vol, pos, base))
@@ -495,6 +641,44 @@ def bar_dt(ContextInfo):
         return time.strftime('%Y-%m-%d %H:%M')
 
 
+def try_add(ContextInfo, code, pos_now, cost, cross_up, key1h, bar_key, f60):
+    # pyramid add (stocks only): floating >= ADD_PCT + daily MA20 TREND +
+    # fresh 1h cross-up -> add 1 unit, max MAX_ADDS per position.
+    # Add lots exit with the main position (the exit side sells all sellable).
+    if not (USE_ADDS and cross_up) or is_etf(code):
+        return False
+    if code in BLOCKLIST or ADDS.get(code, 0) >= MAX_ADDS:
+        return False
+    hhmm = bar_dt(ContextInfo)[11:16]
+    if hhmm >= ENTRY_TO:
+        return False
+    if cost <= 0.0:
+        return False
+    price = get_last_price(ContextInfo, code)
+    if price <= 0.0 or price < cost * (1.0 + ADD_PCT):
+        return False
+    rt = regime_trend(ContextInfo, code)
+    if rt is not True:
+        return False
+    if LAST_ACT.get((code, 'ADD')) == key1h:
+        return False
+    vol = sized_vol(code, 1.0)
+    if vol < 100:
+        return False
+    sim_prev = list(SIM_POS[code]) if code in SIM_POS else None
+    do_order(ContextInfo, code, 23, vol)
+    VERIFY[code] = ['BUY', pos_now, vol, 0, 'ADD', time.time(), sim_prev]
+    LAST_ACT[(code, 'ADD')] = key1h
+    ADDS[code] = ADDS.get(code, 0) + 1
+    adds_save()
+    if code in SIM_POS:
+        simpos_on_buy(ContextInfo, code, vol, price)
+    print('>>> ADD %s %s %d shares (#%d, px %.2f >= cost %.2f x%.3f, regime TREND), '
+          'fish60=%.3f' % (bar_dt(ContextInfo), code, vol, ADDS[code],
+                           price, cost, 1.0 + ADD_PCT, f60))
+    return True
+
+
 def slot1h(ContextInfo):
     # stable identity of the 1h bar currently forming (A=09:30-10:30,
     # B=10:30-11:30, C=13:00-14:00, D=14:00-15:00), used as the dedup key
@@ -527,8 +711,23 @@ def eff_position(ContextInfo, code):
 
 
 def simpos_on_buy(ContextInfo, code, vol, price):
-    SIM_POS[code] = [vol, price, bar_date(ContextInfo)]
+    old = SIM_POS.get(code)
+    if old:
+        # pyramid add on a sim position: accumulate with weighted cost,
+        # keep the first buy date (T+1 sellability of the new lot is
+        # conservative - the whole sim row freezes again today)
+        tv, tc = old[0] + vol, (old[0] * old[1] + vol * price) / (old[0] + vol)
+        SIM_POS[code] = [tv, tc, bar_date(ContextInfo)]
+    else:
+        SIM_POS[code] = [vol, price, bar_date(ContextInfo)]
     simpos_save()
+
+
+def simpos_add_rollback(code, prev):
+    # VERIFY total-fail on an ADD: restore the pre-add sim lot, not delete it
+    if prev is not None:
+        SIM_POS[code] = prev
+        simpos_save()
 
 
 def simpos_on_sell(code):
@@ -538,23 +737,26 @@ def simpos_on_sell(code):
 
 
 def init(ContextInfo):
-    global CODES, VOL_MAP, T0_SET, PENDING, SIM_POS, SIM_POS_PATH, EXDEF
+    global CODES, VOL_MAP, T0_SET, PENDING, SIM_POS, SIM_POS_PATH, EXDEF, ADDS, ADDS_PATH
     ContextInfo.strategyName = 'qmt_executor_v2'
     if not getattr(ContextInfo, 'accountid', ''):
         ContextInfo.accountid = ACCOUNT_ID
     if getattr(ContextInfo, 'do_back_test', False):
-        # backtest: separate ledger so the live/sim file is never clobbered
+        # backtest: separate ledgers so the live/sim files are never clobbered
         SIM_POS_PATH = SIM_POS_FILE.replace('.csv', '_backtest.csv')
+        ADDS_PATH = ADDS_FILE.replace('.csv', '_backtest.csv')
     CODES, VOL_MAP, T0_SET = load_codes()
     PENDING = pending_load()
     EXDEF.update(exdef_load())
+    ADDS = adds_load()
     SIM_POS = simpos_load()
     ContextInfo.set_universe(CODES)
-    print('=== qmt_executor_v2 rev=%s start, account=%s codes=%d vol=%d gate=%s exit_a=%s esi_exit=%s sell_gate=%s etf_entries=%s t0=%d backtest=%s pending=%s sim_pos=%s ==='
+    print('=== qmt_executor_v2 rev=%s start, account=%s codes=%d vol=%d gate=%s exit_a=%s esi_exit=%s sell_gate=%s sell_mc=%.2f/%.2f sizing=%s adds=%s(%.2f%%,x%d) etf_entries=%s t0=%d blocklist=%d backtest=%s pending=%s sim_pos=%s ==='
           % (REV, acc_id(ContextInfo), len(CODES), VOLUME, USE_ENTRY_GATE, USE_EXIT_A,
              (USE_ESI_EXIT and 'stock-off/etf-on' or 'off'), '/'.join(EXIT_CONFIRM_TFS),
+             SELL_MC_STOCK, SELL_MC_ETF, SZ4_SIZING, USE_ADDS, ADD_PCT * 100, MAX_ADDS,
              ETF_ENTRIES,
-             len(T0_SET), getattr(ContextInfo, 'do_back_test', False),
+             len(T0_SET), len(BLOCKLIST), getattr(ContextInfo, 'do_back_test', False),
              list(PENDING.keys()), SIM_POS))
 
 
@@ -602,14 +804,15 @@ def handlebar(ContextInfo):
         pos, cost, sellable, is_sim = eff_position(ContextInfo, code)
         cross_up = len(f) >= 3 and f[-1] > f[-2] and f[-2] <= f[-3]
         cross_down = len(f) >= 3 and f[-1] < f[-2] and f[-2] >= f[-3]
-        if cross_down and t60 - f60 < MIN_CROSS:
+        if cross_down and t60 - f60 < sell_mc(code):
             # magnitude floor, mirrored from the entry side: hairline
             # down-crosses whipsaw deep-negative names at every small gap
             # (2026-09-29 open dump); ignore them entirely (also blocks the
-            # T+1 EXDEF latch below)
+            # T+1 EXDEF latch below). Floor is per-instrument since 2026-10-05b
+            # (stocks 0.50 / ETF 0.15, full-market sweep).
             cross_down = False
             print('[SKIP] %s %s down-cross too thin %.3f < %.2f (hairline), ignored'
-                  % (bar_key, code, t60 - f60, MIN_CROSS))
+                  % (bar_key, code, t60 - f60, sell_mc(code)))
         # dedup key = identity of the 1h bar currently forming. Do NOT use the
         # fisher values themselves: live handlebar is tick-driven (~3s L1
         # snapshots) and the forming bar's fisher drifts every tick, so a
@@ -633,8 +836,13 @@ def handlebar(ContextInfo):
                 # position gone (sold/manually closed) - drop stale deferred exit
                 EXDEF.pop(code, None)
                 exdef_save()
+            if code in ADDS:
+                ADDS.pop(code, None)     # 平仓后加仓计数归零
+                adds_save()
             if is_etf(code) and not ETF_ENTRIES:
                 continue            # ETF entry switch off: exits still managed
+            if code in BLOCKLIST:
+                continue            # 动态刹车：trailing 回放为负，只管理卖出
             if bar_dt(ContextInfo)[11:16] >= ENTRY_TO:
                 # late-day entries blocked (see ENTRY_TO comment); throttle log
                 lk = (code, 'LATE')
@@ -647,10 +855,13 @@ def handlebar(ContextInfo):
                 cross_up = False
                 print('[SKIP] %s %s cross too thin %.3f < %.2f (hairline), ignored'
                       % (bar_key, code, f60 - t60, MIN_CROSS_ENTRY))
-            if cross_up and f60 >= MAX_F60:
-                cross_up = False
-                print('[SKIP] %s %s high-position entry fish60=%.3f >= %.2f, ignored'
-                      % (bar_key, code, f60, MAX_F60))
+            mult = 1.0
+            if cross_up:
+                mult = entry_mult(code, f60, bar_dt(ContextInfo)[11:16])
+                if mult <= 0.0:
+                    cross_up = False
+                    print('[SKIP] %s %s SZ4 sizing: fish60=%.3f >= 1.0, entry skipped'
+                          % (bar_key, code, f60))
             if cross_up and LAST_ACT.get((code, 'BUY')) != key1h:
                 if USE_ENTRY_GATE:
                     downs = []
@@ -669,13 +880,18 @@ def handlebar(ContextInfo):
                         print('[SKIP] %s %s cross up but %s in down state '
                               '(fake-invalid, watching)' % (bar_dt(ContextInfo), code, '/'.join(downs)))
                         continue
-                vol = VOL_MAP.get(code, VOLUME)
+                vol = sized_vol(code, mult)
+                if vol < 100:
+                    print('[SKIP] %s %s sized vol %d < 100 (mult %.2f), entry skipped'
+                          % (bar_key, code, vol, mult))
+                    continue
                 do_order(ContextInfo, code, 23, vol)
                 VERIFY[code] = ['BUY', pos, vol, 0, 'BUY', time.time()]
                 LAST_ACT[(code, 'BUY')] = key1h
                 pending_remove(code)
                 simpos_on_buy(ContextInfo, code, vol, get_last_price(ContextInfo, code))
-                print('>>> BUY %s %s %d shares, fish60=%.3f' % (bar_dt(ContextInfo), code, vol, f60))
+                print('>>> BUY %s %s %d shares (x%.1f units), fish60=%.3f'
+                      % (bar_dt(ContextInfo), code, vol, mult, f60))
                 continue
 
             # R2 reactivation watch: pending code, no fresh 1h cross needed
@@ -698,14 +914,21 @@ def handlebar(ContextInfo):
             if ups:
                 if LAST_ACT.get((code, 'BUY')) == key1h:
                     continue
-                vol = VOL_MAP.get(code, VOLUME)
+                mult = entry_mult(code, f60, bar_dt(ContextInfo)[11:16])
+                if mult <= 0.0:
+                    print('[SKIP] %s %s SZ4 sizing at reactivation: fish60=%.3f, skipped'
+                          % (bar_key, code, f60))
+                    continue
+                vol = sized_vol(code, mult)
+                if vol < 100:
+                    continue
                 do_order(ContextInfo, code, 23, vol)
                 VERIFY[code] = ['BUY', pos, vol, 0, 'REACTIVATED', time.time()]
                 LAST_ACT[(code, 'BUY')] = key1h
                 pending_remove(code)
                 simpos_on_buy(ContextInfo, code, vol, get_last_price(ContextInfo, code))
-                print('>>> BUY %s %s %d shares (REACTIVATED after fake-invalid), '
-                      'fish60=%.3f' % (bar_dt(ContextInfo), code, vol, f60))
+                print('>>> BUY %s %s %d shares (x%.1f, REACTIVATED after fake-invalid), '
+                      'fish60=%.3f' % (bar_dt(ContextInfo), code, vol, mult, f60))
 
         else:
             if sellable <= 0:
@@ -732,6 +955,9 @@ def handlebar(ContextInfo):
                         print('[T+1] %s %s frozen but %s fired - latched, will exit when sellable'
                               % (bar_dt(ContextInfo), code, reason))
                     continue
+                # 冻结期没有出场信号时仍允许加仓（买入不受 T+1 限制）
+                try_add(ContextInfo, code, pos, cost, cross_up, key1h,
+                        bar_key, f60)
                 pkey2 = '%s|T1' % pkey
                 if LAST_PRINT.get((code, 'T1')) != pkey2:
                     LAST_PRINT[(code, 'T1')] = pkey2
@@ -859,6 +1085,8 @@ def handlebar(ContextInfo):
                     print('>>> ESI-SELL %s %s %d shares (30m down, price %.2f < cost %.2f)'
                           % (bar_dt(ContextInfo), code, sellable, price, cost))
                 # floating profit: keep holding for Exit A
+            # 顺势加仓（无出场信号时；函数内部自判 USE_ADDS/ETF/BLOCKLIST/窗口）
+            try_add(ContextInfo, code, pos, cost, cross_up, key1h, bar_key, f60)
     elapsed = time.time() - t_start
     if elapsed > 30:
         print('[WARN] handlebar took %.1fs for %d codes' % (elapsed, len(CODES)))
