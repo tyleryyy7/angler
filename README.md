@@ -1,357 +1,65 @@
-# Fisher Transform 60 分钟线「刚上穿」扫描器（沪深 A 股）
+# angler（钓鱼）
 
-基于 akshare 的盘中实时预警脚本。扫描股票池，选出**刚发生 Fisher 上穿 Trigger** 的股票。
-信号分两类：**完结确认**（60 分钟 bar 收盘后判定）和**盘中信号**（`--live`，bar 未走完就判定，
-可能收盘前消失/翻转，推送会标注「未完结」）。同一根 bar 同一完结状态的信号当日只推一次；
-盘中信号推过后，收盘完结确认仍会再推一次。
+沪深 A 股 / ETF 量化交易系统：夜间建股票池，盘中扫描 60 分钟 Fisher Transform
+上穿信号（买入）、监控下穿信号（卖出），结果推送企业微信机器人；QMT 内置执行器
+按同一套规则自动下单。全流程 Windows 计划任务驱动，单数据源（通达信客户端 TQ 接口）。
 
-数据源由 `fisher_scanner.py` 配置区的 `DATA_SOURCE`（或 `--source` 参数）决定：
+## 策略一句话
 
-- `"tdxq"`（默认，通达信官方客户端 TQ 接口）：走本机已登录的通达信客户端（TdxW.exe）
-  会话取数，原生前复权、无限流；须客户端登录常开，且客户端内做过一次
-  「盘后数据下载（勾 5 分钟线）」。整池批量预取 + 本地缓存（cache/tdxq/），全池扫描秒级。
-- `"sina"`（新浪，次备）：前复权准确；分钟线接口会限流（HTTP 456），冷却几十分钟自愈；
-  已做分钟线直连+因子当日缓存优化（每股 1 次请求）。
-- ~~gm~~（掘金，已删 2026-09-14）：建池已切 tdxq、扫描兜底已删，整体退役。
-- `"em"`（东方财富）：K线接口被本机网络 WAF 封锁，本机不可用。
-- ~~tdx~~（通达信公开服务器，已删 2026-09-14）：服务端整体拒数，git 历史可查。
-- ~~qmt~~（国金 miniQMT，已删 2026-09-14）：权限被收回，git 历史可查。
+**买看 60m Fisher 上穿 + 小周期不拖累，卖看 60m 下穿（分品种幅度门槛）让利润奔跑**；
+深位加倍、高位不做、下午减半、日共振加档；浮盈且日线趋势态时顺势加仓；
+月度回放为负的票自动进刹车名单只卖不买。
 
-盘中调度器 `run_scan.py` 按 **tdxq → sina** 顺序自动降级（失败率 >50% 即切换）。
+所有规则都经过全市场 904 只公共过滤票 × 10.5 个月（2024-11 起）× 百万级成交笔数
+的回放验证，验证口径与结论档案见 `AGENTS.md` 与 `results/`。
 
-## 信号定义
-
-与你的 TradingView Pine 代码 / 同花顺公式完全一致：
-
-- `fish2 = fish1[1]`，即 Trigger 就是 Fisher 的前一根值
-- 因此「上穿」= **Fisher 由跌转升的拐点**：`fish[t] > fish[t-1]` 且 `fish[t-1] <= fish[t-2]`
-- 指标为递归计算，脚本取最近全部 bar（暖机 80 根以上即精确）
-
-A 股 60 分钟 bar 一天 4 根，东财时间戳为 bar **结束**时刻：10:30 / 11:30 / 14:00 / 15:00。
-
-## 文件结构
+## 系统架构
 
 ```
-fisher_60min_scanner/
-├── fisher_scanner.py    # 主程序（配置区在文件头部，参数可调）
-├── build_pool_tdxq.py   # 五池生成器（通达信客户端 TQ 版，当前默认；跑在主环境 .venv，须客户端登录）
-├── build_pool_dual.py   # 三池生成器（新浪版，备用）
-├── scan_all.cmd         # 定时任务入口：深水+观察+持仓（2026-09-14 起精简，降 sina 限流风险），完结确认（bar 收盘后）
-├── scan_mid.cmd         # bar 中段扫描入口（--live，盘中信号）
-├── scan_holdings.cmd    # 持仓每 5 分钟监控入口（--holdings --live）
-├── scan_daily.cmd       # 深水池日共振收盘复核入口（--daily-confirm，15:10）
-├── scan_hssr.cmd        # HSSR 周报入口（--hssr-report，每周日 20:00）
-├── build_pool.cmd       # 16:00 一条龙入口（互斥锁 + 盘后自动下载 + tdxq 建五池 + HSSR 注解 + 盘后候选）
-├── run_hidden.vbs       # 隐藏控制台启动器（计划任务经它调用 .cmd，不弹窗）
-├── holdings.csv         # 持仓清单（--buy 登记，下穿监控对象）
-├── AGENTS.md            # AI 助手交接文档
-├── requirements.txt     # 依赖
-├── 使用说明.md          # 本文件
-├── results/             # 扫描结果 CSV（运行后自动生成）
-└── scanner.log          # 运行日志（运行后自动生成）
+通达信客户端(TQ)                 企业微信机器人
+      │ 取数(日线/分钟线)              ▲ 推送
+      ▼                              │
+建池(build_pool.cmd, 交易日16:00)     │
+  → 五池 CSV + 盘后候选(带SZ4仓位档/刹车标)
+      │                              │
+扫描(run_scan.py, 盘中暂停中)  ───────┤
+      │                              │
+执行(executor_v2.py, QMT客户端内置) ──┘ 自动下单+台账+成交核对
+      ▲                              │
+月检(theme_brake.py, 每月1日) ───────┘
+  → trailing回放 → 刹车名单/参数漂移/名单建议/组合层提示
 ```
 
-## 每日工作流（推荐）
+## 目录导览
 
-全自动：Windows 计划任务工作日 17:00 一条龙（盘后下载+建池+候选推送，须通达信客户端登录在线）；盘中每根 60 分钟 bar 的中段
-（10:01/11:01/13:31/14:31，四根 bar 的中点）扫盘中信号（未完结 bar）、收盘后（10:31/11:31/14:01/15:01）
-扫完结确认，全部池 + 持仓并推送企业微信；持仓另加每 5 分钟（9:31 起）高频监控
-（见下文「正式运行」）。
-
-手动命令：
-
-```bash
-# 建池（tdxq 通达信客户端版，全量约 1 分钟；须通达信客户端 TdxW.exe 登录在线）
-.venv\Scripts\python.exe build_pool_tdxq.py
-
-# 深水池 HSSR 注解（主环境 .venv，默认 sina 串行防限流约 4 分钟；build_pool.cmd 已含此步）
-.venv\Scripts\python.exe fisher_scanner.py --annotate-hssr
-
-# 盘中扫描（按池选用）
-.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv
-.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_deep.csv
-```
-
-### 方案一：右侧 / 左侧 / 深水 / T0 / T1 五池构建（两个数据源任选）
-
-五个池一次构建，输出文件名固定
-（`pool_right.csv` / `pool_left.csv` / `pool_deep.csv` / `pool_t0.csv` / `pool_t1.csv`），扫描器无需任何改动。
-
-**方案 A：tdxq 通达信客户端（推荐，须通达信客户端登录在线）**
-
-```bash
-# 通达信客户端（TdxW.exe）保持登录；盘后数据下载已由 17:00 一条龙自动化，无需手动
-.venv\Scripts\python.exe build_pool_tdxq.py              # 全量约 1 分钟
-```
-
-> 注意：TQ 的分钟 K 线是静态库（官方确认盘中仅日 K，2026-09-15 实测），
-> 盘中扫描靠 `tick_bar_builder.py` 快照聚合补实时 bar——在 TQ 策略管理器里
-> 把 D:\tdx\PYPlugins\user\tick_bar_builder.py 加为策略并设「随终端运行」即可，
-> 覆盖 top50 深水 + 持仓 + 观察池；没开它时盘中扫描自动降级 sina，系统照常工作。
-
-**方案 B：新浪（无需注册任何账号，开箱即用）**
-
-```bash
-pip install -r requirements.txt
-.venv\Scripts\python.exe build_pool_dual.py            # 全量约 90 分钟，建议夜间运行
-.venv\Scripts\python.exe build_pool_dual.py --resume   # 断点续跑
-```
-
-两个方案的过滤/分类逻辑完全一致，输出可互相替换：
-
-```bash
-# 盘中按策略选用（2026-09-14 起盘中只扫 深水/观察/持仓，其余池暂停；建池不受影响）：
-.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_right.csv   # 右侧
-.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_left.csv    # 左侧
-.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_deep.csv    # 深水
-.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_t0.csv      # T+0 ETF
-.venv\Scripts\python.exe fisher_scanner.py --once --pool-file pool_t1.csv      # T+1 ETF
-```
-
-公共条件：仅沪深主板（剔创业板/科创板/北交所）、非 ST/退、非停牌、股价 ≥ 2 元、
-20 日均成交额 ≥ 2 亿、20 日均振幅 ≥ 2.5%、上市满 1 年。输出含 dif/dea/fisher_daily 核对列。
-
-五个池的分化条件：
-
-| 池 | 条件 | 思路 |
-|---|---|---|
-| 右侧 pool_right.csv | MACD DIF 连升两日 且 DIF > DEA 且 **DIF > 0** | 零上趋势已成，追随 |
-| 左侧 pool_left.csv | MACD DIF 连升两日 且 DIF < DEA 且 **DIF < 0** | 零下拐点将至，埋伏 |
-| 深水 pool_deep.csv（实验） | 无 MACD 闸门，日线 Fisher < -2；附 HSSR 预计算列（见下） | 深度超卖反弹，池内按五维打分降序 |
-| T0 pool_t0.csv | T+0 ETF + 日线 Fisher < -2（剔联接/货币，上市 120 天+，成交额 ≥ 1 亿、振幅 ≥ 1%） | 超卖反弹，当日可进出 |
-| T1 pool_t1.csv | T+1 ETF + 日线 Fisher < -2（同上过滤） | 超卖反弹 |
-
-（零上回调 DIF>0 但 DIF<DEA、零下反弹 DIF<0 但 DIF>DEA 的中间态两边都不入。）
-
-**深水日共振**（收盘复核，15:10）：深水池中当天任一根已完结 60m bar Fisher 上穿
-且当日日 K（已完结）Fisher 也上穿的票，推送 pond=深水日共振，结果写
-`results/fisher_cross_*_deepres.csv`。手动跑：`run_scan.py --daily-confirm`
-或 `fisher_scanner.py --daily-resonance`。
-
-**深水池打分**（pool_deep.csv 按 score 降序，列 sA~sE 为分项）：
-
-| 维度 | 权重 | 规则 |
-|---|---|---|
-| A 下跌减速 | 30% | MACD 绿柱连缩 2 日 +1；DIF 拐头 +1；Fisher 底背离 +1，封顶 +2 |
-| B 位置支撑 | 25% | 距 240 日前低 ≤3% → +2，≤8% → +1；破位 → -2 |
-| C 资金 CMF(20) | 20% | 连续 3 日改善 +1（且 >0 则 +2）；连续 3 日恶化 -1；创 20 日新低 -2 |
-| D 周线共振 | 15% | 周线 Fisher < -2 → +2；周线 Fisher >1 且拐头向下 → -2（周一最糙周四五最准） |
-| E 极端度归一化 | 10% | 当前 Fisher 在自身历史分布 <5% 分位 → +2；<15% → +1 |
-
-总分 = Σ权重×分项，范围 -2~+2，tdxq 版建池支持。
-
-**深水池 HSSR 预计算**（`pool_deep.csv` 的 hssr/hssr_n 两列）：建池后由主环境 .venv
-注解步骤（`build_pool.cmd` 第二步，或手动 `fisher_scanner.py --annotate-hssr`）
-对每只股票回测历史 60m 完结 bar 上穿信号——信号出现后 10 根 bar close 上涨记成功，
-取最近 20 次可评估信号（最后 10 根 bar 内的信号不可评估，剔除），样本 < 5 留空。
-深历史走 sina。
-深水推送按档位附仓位建议：≥75% 正常仓位；50–75% 仓位减半；<50% 不建议买入；
-样本不足标注「HSSR 样本不足 (n<5)」。
-
-注意：日线 Fisher 以凌晨建池时的上一交易日收盘为准，盘中固定不变。
-
-### 持仓监控（下穿预警 + 上穿回钩）与观察池
-
-买入后登记到 `holdings.csv`（或直接告诉我帮你登记）：
-
-```bash
-.venv\Scripts\python.exe fisher_scanner.py --buy 600036 --price 38.86   # --price 可省，缺省取最新价
-```
-
-- **持仓双向监控**：每个时点扫下穿（卖出预警「持仓鱼塘：N 条鱼下穿」）+ 上穿（回钩/加仓提示
-  「持仓鱼塘：N 条鱼回钩」）。部分减仓不用动文件。
-- **清仓**：`--sell CODE` 一条命令把股票移出持仓并加入观察池 `watchlist.csv`，
-  继续盯 60 分钟上穿，命中推送「观察鱼塘：N 条鱼回钩」——日线逻辑还在的票不会跟丢。
-- **观察池**：也可直接 `--watch CODE` 手动加入任意股票、`--unwatch CODE` 移出；`--buy` 买回时自动移出观察池。
-- 持仓/观察池无命中不推送（避免噪音）；卖出后不想盯了就 `--unwatch CODE` 或删掉 watchlist.csv 对应行。
-
-手动触发持仓下穿扫描：
-
-```bash
-.venv\Scripts\python.exe fisher_scanner.py --once --pool-file holdings.csv --side down
-```
-
-卖出后编辑 `holdings.csv` 删掉对应行即可。
-
-### 单票体检（--inspect）
-
-```bash
-.venv\Scripts\python.exe fisher_scanner.py --inspect 600498          # 支持代码或中文名
-.venv\Scripts\python.exe fisher_scanner.py --inspect 烽火通信 --push  # --push 把报告推送到企业微信
-```
-
-名称先从各池/持仓/观察池 CSV 反查代码，查不到再用新浪全市场快照反查，都查不到才报错。
-报告含五段：身份（持仓成本/现价/浮盈、观察池、五池归属，深水池附 score 和 hssr/hssr_n）、
-日线（fisher/trigger、深水条件 fisher<-2、日 K 上穿）、60m（完结/live 两种口径信号、
-最近一次上穿/下穿时间）、30m+ESI（台账记录与 open 窗口进度 x/6）、
-HSSR（现场计算，附仓位档位）。单项取数失败只标注「取数失败」，不影响其他段。
-
-### Fisher-ESI 规则 v2（2026-09-14 重写）
-
-买入信号的小周期共振过滤 + 持仓失效卖出，台账 `cache/esi_ledger.csv`（进场/离场）
-+ `cache/esi_pending.csv`（假性失效待激活）：
-
-- **进场过滤（所有买入信号）**：60m 上穿命中时，30m/15m/5m 任一周期处于下行段
-  （fish < trigger）→ 信号记「假性失效」，推送标注「待激活」，不作为有效买入。
-- **信号激活**：假性失效票由持仓监控任务每 5 分钟复查：三周期全部重新上穿
-  且 60m 趋势未破坏（fish > trigger）→ 推送「信号激活」，正式登记进场。
-- **进场登记**：通过过滤的持仓完结 60m 上穿（0 < fisher < 2.5）→ 台账记 open；
-  当日已有 failed 记录的票当日禁止重新开仓。
-- **失效卖出**：进场后任一完结 30m bar 下穿时——浮亏（现价 < 进场价）→ 立即推送
-  「Fisher失效」卖出预警，记 failed=是；浮盈 → 继续持有，等 60m 下穿正常离场
-  （记 failed=否）。
-- **HSSR 周报**：按 code 取最近 20 条 closed 台账记录，HSSR = 未失效数/总数，
-  附平均失效分钟数，每周日 20:00 推送企业微信。手动跑：
-  `.venv\Scripts\python.exe run_scan.py --hssr-report`。
-
-## 安装与快速测试
-
-```bash
-pip install -r requirements.txt
-
-# 先小规模测试（只扫前 50 只，验证环境）
-.venv\Scripts\python.exe fisher_scanner.py --once --limit 50
-```
-
-## 正式运行（两种方式选一）
-
-### 方式 A：cron / 任务计划程序（推荐，最稳）
-
-每根 bar 收盘后 1 分钟各跑一次：
-
-```cron
-# Linux crontab（周一到周五）；第一行为凌晨建池（用前一交易日收盘数据）
-0  0  * * 1-5  cd /路径 && /usr/bin/python3 build_pool_dual.py
-31 10 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
-31 11 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
-1  14 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
-1  15 * * 1-5  cd /路径 && for p in right left deep t0 t1; do /usr/bin/python3 fisher_scanner.py --once --pool-file pool_$p.csv; done
-```
-
-Windows 已在「任务计划程序」注册以下任务（用 `schtasks /query | findstr fisher` 查看）：
-
-| 任务名 | 触发 | 动作 |
-|---|---|---|
-| `fisher_建池` | 工作日 16:00 | `build_pool.cmd` 一条龙：盘后自动下载（refresh_kline 全池）→ tdxq 重建五池 + HSSR 注解 + **--post-close 候选清单推送**，需通达信客户端登录在线 |
-| `fisher_持仓`（已禁用） | 每天 9:31–15:20 每 5 分钟 | `scan_holdings.cmd`：持仓上穿/下穿盘中监控（周末脚本内自动退出） |
-| `fisher_扫描1001` / `1101` / `1331` / `1431`（已禁用） | 工作日对应时刻 | `scan_mid.cmd`：深水+观察+持仓，**盘中信号**（未完结 bar） |
-| `fisher_扫描1031` / `1131` / `1401` / `1501`（已禁用） | 工作日对应时刻 | `scan_all.cmd`：深水+观察+持仓，**完结确认**（bar 收盘后） |
-| `fisher_日共振` | 工作日 15:10 | `scan_daily.cmd`：深水池日共振收盘复核（60m 日内上穿 + 当日日 K 上穿） |
-| `fisher_HSSR周报` | 每周日 20:00 | `scan_hssr.cmd`：Fisher-ESI 台账 HSSR 周报推送 |
-
-（2026-09-22 起盘中扫描任务因数据源问题全部禁用，恢复用 `Enable-ScheduledTask -TaskName <名>`。）
-
-所有任务经 `run_hidden.vbs` 隐藏启动，不弹控制台窗口；均已开启
-「错过计划启动后尽快补跑」（StartWhenAvailable）。
-
-注册命令（任务不存在或需重建时执行）：
-
-```cmd
-schtasks /create /f /tn "fisher_建池" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" build_pool.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 16:00
-schtasks /create /f /tn "fisher_持仓" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_holdings.cmd" /sc minute /mo 5 /st 09:31 /et 15:20
-schtasks /create /f /tn "fisher_扫描1001" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_mid.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:01
-:: 1101 / 1331 / 1431 三条同上（scan_mid.cmd），仅改 /tn 与 /st
-schtasks /create /f /tn "fisher_扫描1031" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_all.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 10:31
-:: 1131 / 1401 / 1501 三条同上（scan_all.cmd），仅改 /tn 与 /st
-schtasks /create /f /tn "fisher_日共振" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_daily.cmd" /sc weekly /d MON,TUE,WED,THU,FRI /st 15:10
-schtasks /create /f /tn "fisher_HSSR周报" /tr "wscript.exe \"D:\angler\run_hidden.vbs\" scan_hssr.cmd" /sc weekly /d SUN /st 20:00
-```
-
-补跑开关（新注册任务需执行一次）：
-
-```powershell
-Get-ScheduledTask -TaskName "任务名" | ForEach-Object { $_.Settings.StartWhenAvailable = $true; $_ } | Set-ScheduledTask
-```
-
-结果 CSV 文件名带 `_right` / `_left` / `_deep` / `_t0` / `_t1` / `_holdings` 后缀区分。
-
-### 方式 B：常驻模式
-
-```bash
-.venv\Scripts\python.exe fisher_scanner.py --loop
-```
-
-进程常驻，工作日 10:31 / 11:31 / 14:01 / 15:01 自动扫描（注意：此模式只按星期判断，
-遇法定节假日会照常运行并扫描上一交易日数据，可在结果 CSV 的 bar_time 列看出来，不影响正确性）。
-
-## 输出说明
-
-结果存为 `results/fisher_cross_YYYYMMDD_HHMM.csv`：
-
-| 列 | 含义 |
+| 文件 | 作用 |
 |---|---|
-| code / name | 股票代码 / 名称 |
-| bar_time | 发生上穿的 bar 时刻（bar 结束时刻） |
-| close | 该 bar 收盘价（盘中信号为当时最新价） |
-| fisher / trigger | 该 bar 的 Fisher / Trigger 值 |
-| bar_state | 完结 / 未完结（盘中信号，收盘前可能消失或翻转） |
+| `executor_v2.py` | **大QMT 内置执行器 git 主版本**（部署：客户端编辑器全选粘贴，REV 2026-10-05c） |
+| `fisher_scanner.py` | 主扫描器：信号定义、上穿/下穿判定、多源取数、企业微信推送 |
+| `run_scan.py` | 盘中扫描调度器 + 盘后候选清单生成 |
+| `build_pool_tdxq.py` | 建池（通达信版，当前默认）；`build_pool_dual.py` 新浪版备用 |
+| `theme_brake.py` | 月度动态刹车：trailing 回放 → 刹车名单 + 参数漂移 + 名单建议 |
+| `backtest_v2_replay.py` / `backtest_t0_replay.py` | 回放框架（v2 股票规则 / T0 ETF 规则） |
+| `tdxq_fetch.py` | TQ 批量取数助手（部署副本在通达信 PYPlugins） |
+| `build_ths_block.py` | 同花顺板块导入文件生成 |
+| `build_qmt_watchlist.py` | QMT 名单生成（现为手工小名单，脚本保留） |
+| `tdx_postclose_download.py` | 盘后数据自动下载（16:00 建池任务调用） |
+| `tick_bar_builder.py` | 快照驱动实时 bar 聚合器（通达信 UserPY 常驻） |
+| `weekend test/` | QMT 内置策略测试资产 |
 
-推送已内置：扫描结果通过**企业微信机器人**推送到微信。配置方式：把 webhook 地址写入项目目录的
-`webhook.key` 文件（一行，已在 .gitignore 中），或设置环境变量 `FISHER_WECOM_WEBHOOK`；
-两者都没有则不推送。`PUSH_EMPTY=False` 可让上穿池无命中时不打扰（持仓下穿本就无命中不推送）。
+运行产物（gitignore）：`pool_*.csv`、`results/`、`cache/`、`scanner.log`、
+`ths_blocks/`、`holdings.csv`、`watchlist.csv`、`webhook.key`。
 
-## 重要注意事项
+## 文档
 
-1. **盘中判定**：默认脚本自动丢弃正在形成中的最后一根 bar（价格未走完会信号闪烁），
-   只对已完结 bar 做判断；加 `--live` 则未完结 bar 也参与判定（中段扫描任务使用，
-   推送会标注「未完结」）。同一根 bar 同一完结状态的信号当日只推一次（`cache/pushed_signals.json`
-   去重，键含 bar 完结状态），盘中信号推过后，收盘完结确认仍会再推一次。
-2. **限流**：全市场约 5000 只，默认每只间隔 0.25 秒，东财源一轮约 30~45 分钟（新浪源每股 2 次请求，约 1~1.5 小时）。
-   接口对频繁请求可能限流，脚本已带重试；若失败数偏多，把 `REQUEST_INTERVAL` 调大到 0.4~0.5。
-   **强烈建议先用日线等条件预筛股票池**（如非 ST、成交额、趋势），存成含 `code` 列的 CSV，
-   用 `--pool-file pool.csv` 运行，一轮几分钟。
-3. **数据长度**：东财 60 分钟线的历史长度有限，少于 `MIN_BARS`（默认 80 根）的票自动跳过。
-   递归指标衰减快，80 根以上信号精度即无虞。
-4. **复权**：默认前复权（与同花顺默认一致）；除权缺口会造成假拐点，勿用不复权。
-   tdx 源原始数据不复权，脚本已在 fetch 时乘新浪日线因子近似前复权（与 sina 分支同口径，
-   实测与 sina 复权序列偏差 <0.2%）；个别票因子拉取失败会静默退回不复权数据，属极少数情况。
-5. **与同花顺对数校验**：任选一只票，对比脚本输出 CSV 中的 fisher 值与同花顺副图读数，
-   注意两边复权方式、周期（60 分钟）须一致。
-6. **升级路径**：未来若换 QMT/xtdata，只需重写 `fetch_60m()` 一个函数
-   （返回含 `时间/最高/最低/收盘` 列的 DataFrame），其余逻辑零改动。
+- **`使用说明.md`** — 运维手册：环境搭建、计划任务注册、部署步骤、常见问题
+- **`AGENTS.md`** — 项目交接文档：策略规则精确口径、数据通道、踩坑记录（改代码前必读）、
+  全部回测结论档案（含被否决方向，防止重复踩坑）
 
-## 免责声明
+## 环境
 
-本工具仅为量化研究辅助，输出信号不构成投资建议。Fisher 上穿在震荡市中假信号较多，
-建议结合位置（如零轴下方上穿）、成交量等条件过滤，并自行回测后再使用。
+- Python 3.11（`.venv`）：akshare + pandas；扫描端进程池并发
+- 通达信客户端（TdxW.exe）登录常开 + 每日盘后数据下载
+- 大QMT 客户端（国金证券）内置 Python 3.6 运行执行器
 
-## 大QMT 内置执行器（executor_v2.py）
-
-项目根目录的 `executor_v2.py` 是大QMT 内置策略的 git 主版本；部署副本是
-`D:\国金证券QMT交易端\python\钓鱼.py`（客户端有文件虚拟化，外部写入客户端不可见，
-只能经客户端编辑器全选粘贴部署）。
-对齐扫描器 ESI v2 规则：进场 = 1h 上穿 + R1 小周期闸门（30m/15m/5m 下行段不买）；
-R2 假性失效观察（被拦票进待激活，三周期回上行且 1h 未破 → 激活买入，1h 破趋势 → 作废）；
-离场 = 1h 下穿全卖（USE_EXIT_A）+ R3 亏损即卖（30m 下穿且现价 < 成本，USE_ESI_EXIT）。
-
-**REV 2026-10-05b（全市场 904 只回放验证后的规则升级）**：
-- 卖出下穿幅度门槛分品种：股票 0.50 / ETF 0.15（`SELL_MC_STOCK/SELL_MC_ETF`，可热调）；
-- 仓位分档（股票，watchlist 的 VOLUME = 1 单位）：进场 f60<0 下 2 单位、0≤f60<1 下 1 单位、
-  f60≥1 不进场、13:00 后一律减半（取整百股）；
-- 顺势加仓（股票）：持仓浮盈 ≥1% 且日线 MA20 趋势态且盘中再出 1h 上穿 → 加 1 单位，
-  每仓最多 3 次（`USE_ADDS/ADD_PCT/MAX_ADDS` 可热调，台账 D:\qmt\adds.csv）；
-- 动态刹车：`D:\qmt\v2_blocklist.txt` 名单内票只卖不买（theme_brake.py 每月 1 日生成）；
-- 原 MAX_F60 进场上限已移除（被分档的 f60≥1 跳过取代）。
-
-### 部署
-1. 在 QMT 客户端策略编辑器里**全选粘贴**仓库 `executor_v2.py` 内容（sync_qmt 一键同步已失效删除：
-   客户端对 python\ 目录有文件虚拟化，外部写入客户端不可见）。源文件 UTF-8、纯 ASCII、
-   py3.6、无 pandas。粘贴后在客户端重启策略加载新版本，启动横幅核对 REV。
-2. 账号优先用 QMT 客户端运行界面绑定的账号（ContextInfo.accountid），配置区 `ACCOUNT_ID`
-   仅作兜底；另改 `VOLUME`（默认每单股数）、三个开关。
-   数据周期参数 `'1h'`——国金构建不认 `'60m'`；回测/运行界面周期建议选 5 分钟（R3 响应快）。
-3. 客户端「数据管理 → 补充数据」下载标的的 1h/30m/15m/5m 历史（至少 3 个月）。
-4. 先回测模式短区间验证，再模拟盘，再实盘（9/11 新规环境先问客户经理报备流程）。
-
-### 运行时文件（D:\qmt\，纯英文路径必须，经 qmt-live 联接在 VSCode 可见）
-- `watchlist.txt`：标的清单，每行 `CODE` 或 `CODE,VOLUME`（该票独立交易量），# 注释。
-- `pending.csv`：R2 待激活观察列表，执行器自动读写，持久化防断网/重启。
-
-### 注意
-- 持仓以账户实查为准（get_trade_detail_data），同根 1h bar 不重复下单（费雪状态值去重）。
-- T+1：当天买入不可当天卖，进场日的离场信号会被券商拒单，执行器后续 bar 自动重试。
-- R3 成本价字段按 m_dOpenPrice/m_dPositionCost/m_dCostPrice 顺序尝试，日志出现
-  cost unknown 警告时需要按账户对象实际字段名调整 get_position()。
-- **C++ API 参数类型严格**（2026-09-15 实发）：get_trade_detail_data / passorder 的账号必须是
-  str（int 报 ArgumentError），passorder 的 price/volume 必须是 double（float(volume)，市价
-  价格位传 -1.0）。代码里已统一 str()/float() 处理，改动时勿退回 int 直传。
+> 仅个人量化研究用途，不构成投资建议。

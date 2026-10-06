@@ -421,4 +421,5 @@ TREND 态少数票（黄金/创新药，+4.1k）适用浅位趋势跟随，V2 �
 
 远程：git@github.com:tyleryyy7/angler.git（main 分支，SSH key 已配好）。
 提交前确认 git status 里没有 webhook.key / holdings.csv / pool*.csv。
-README.md 是 使用说明.md 的副本，改文档时两边同步。
+README.md 自 2026-10-05 起是独立的 GitHub 门面文档（项目简介+架构+目录导览），
+不再是 使用说明.md 的副本——运维细节只维护 使用说明.md，README 跟着大版本随手更新即可。
